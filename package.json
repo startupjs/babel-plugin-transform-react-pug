@@ -1,6 +1,6 @@
 {
   "name": "@startupjs/babel-plugin-transform-react-pug",
-  "version": "7.0.1",
+  "version": "7.0.1-0",
   "publishConfig": {
     "access": "public"
   },
