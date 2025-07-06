@@ -428,13 +428,66 @@ export default PugComponent;
         }
 
         const lspCompletionItems: CompletionItem[] = [];
+        const tsProgram = tsLangService.getProgram(); // Get program once for performance if using sourceFile from it
+
         for (const entry of tsCompletions.entries) {
+          const details = tsLangService.getCompletionEntryDetails(
+            virtualTsxFilename,
+            jsxOffset,
+            entry.name,
+            undefined, // formatOptions
+            entry.source, // source for auto-imports
+            undefined, // preferences
+            entry.data // data from entry
+          );
+
           const lspItem: CompletionItem = {
             label: entry.name,
             kind: mapTsCompletionKindToLspKind(entry.kind),
+            detail: details?.displayParts ? displayPartsToString(details.displayParts) : undefined,
+            documentation: details?.documentation ? displayPartsToString(details.documentation) : undefined,
+            // sortText: entry.sortText, // Consider adding if TS provides useful sortText
+            // data: entry.data // Pass along data for potential resolve step if ever implemented
           };
+
+          if (details?.codeActions && details.codeActions.length > 0) {
+            // Assuming the first codeAction and its first change are the primary edit.
+            // Real-world scenarios might need more sophisticated logic to pick the right action/change.
+            const firstAction = details.codeActions[0];
+            if (firstAction.changes.length > 0) {
+              const firstFileTextChange = firstAction.changes[0]; // ts.FileTextChanges
+              if (firstFileTextChange.fileName === virtualTsxFilename && firstFileTextChange.textChanges.length > 0) {
+                const tsTextChange = firstFileTextChange.textChanges[0]; // ts.TextChange (usually one for a completion)
+
+                const jsxSourceFile = tsProgram?.getSourceFile(virtualTsxFilename);
+                if (jsxSourceFile) {
+                  const startLoc = ts.getLineAndCharacterOfPosition(jsxSourceFile, tsTextChange.span.start);
+                  const endLoc = ts.getLineAndCharacterOfPosition(jsxSourceFile, tsTextChange.span.start + tsTextChange.span.length);
+                  const jsxRange = Range.create(startLoc.line, startLoc.character, endLoc.line, endLoc.character);
+
+                  // Use the mapData obtained earlier for this literal.
+                  // No need to re-parse, ensure mapData is not destroyed prematurely.
+                  const pugRange = mapJsxRangeToPugRange(jsxRange, mapData); // Use existing mapData
+                  if (pugRange) {
+                    const docRelativePugRange = Range.create(
+                      literal.contentRange.start.line + pugRange.start.line,
+                      (pugRange.start.line === 0 ? literal.contentRange.start.character : 0) + pugRange.start.character,
+                      literal.contentRange.start.line + pugRange.end.line,
+                      (pugRange.end.line === 0 ? literal.contentRange.start.character : 0) + pugRange.end.character
+                    );
+
+                    // TODO: Transform tsTextChange.newText (JSX) to Pug syntax if necessary.
+                    // For now, using it as-is. This will be incorrect for JSX tags.
+                    lspItem.textEdit = TextEdit.replace(docRelativePugRange, tsTextChange.newText);
+                  }
+                }
+              }
+            }
+          }
           lspCompletionItems.push(lspItem);
         }
+        // Destroy mapData after processing all completion entries for this literal
+        destroySourceMapData(mapData);
         return lspCompletionItems;
       }
     }
