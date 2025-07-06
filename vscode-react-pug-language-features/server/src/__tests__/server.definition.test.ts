@@ -326,8 +326,9 @@ describe('onDefinition Handler', () => {
     serverModule.extractImportStatements.mockReturnValue([]);
     jest.spyOn(serverModule, 'extractDeclarationsAndParamsFromScope').mockReturnValue({
         declarations: [],
-        paramTexts: ["let paramAlpha: any;", "let paramBeta: any;"]
+        parameterNames: ["paramAlpha", "paramBeta"] // Updated to parameterNames
     });
+    // The createVirtualTsxContent helper in server.ts will generate "let paramAlpha: any;" etc.
 
     const generatedJsx = "<p>{paramAlpha}</p>";
     (compilePugToJsxString as jest.Mock).mockReturnValue({ jsx: generatedJsx, sourceMap: { version: 3, sources:[], mappings:'' }});

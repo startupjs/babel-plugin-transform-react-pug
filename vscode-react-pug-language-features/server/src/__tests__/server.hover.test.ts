@@ -320,11 +320,11 @@ describe('onHover Handler', () => {
       enclosingScopeNode: functionScopeNode,
     }]);
     serverModule.extractImportStatements.mockReturnValue([]);
-    // Mock extractDeclarationsAndParamsFromScope to return dummy param declarations
     jest.spyOn(serverModule, 'extractDeclarationsAndParamsFromScope').mockReturnValue({
         declarations: [],
-        paramTexts: ["let hoverParam: any;", "let anotherParam: any;"]
+        parameterNames: ["hoverParam", "anotherParam"] // Updated to parameterNames
     });
+    // The createVirtualTsxContent helper in server.ts will generate "let hoverParam: any;" etc.
 
     const generatedJsx = "<p>{hoverParam}</p>";
     (compilePugToJsxString as jest.Mock).mockReturnValue({ jsx: generatedJsx, sourceMap: { version: 3, sources:[], mappings:'' } });

@@ -387,8 +387,9 @@ describe('validateTextDocument - Diagnostics via JSX', () => {
     serverModule.extractImportStatements.mockReturnValue([]);
     jest.spyOn(serverModule, 'extractDeclarationsAndParamsFromScope').mockReturnValue({
         declarations: [],
-        paramTexts: ["let paramNum: any;", "let paramStr: any;"] // TS will infer 'any' if not specified, or treat as such for some checks
+        parameterNames: ["paramNum", "paramStr"] // Updated to parameterNames
     });
+    // The createVirtualTsxContent helper in server.ts will generate "let paramNum: any;" etc.
 
     const generatedJsx = "<p>{paramNum()}</p>";
     (compilePugToJsxString as jest.Mock).mockReturnValue({ jsx: generatedJsx, sourceMap: { version: 3, sources:[], mappings:'' }});
