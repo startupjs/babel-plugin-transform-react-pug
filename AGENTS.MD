@@ -1,0 +1,146 @@
+# Project: React Pug Language Server for VS Code
+
+## 🦓 Project Goal
+
+The primary goal of this project is to create a VS Code extension that provides a **JSX-like editing experience for Pug tagged template literals within React JavaScript and TypeScript files**. This means that when a developer writes Pug inside `pug\`...\``, they should get rich language features (autocompletion, hover info, diagnostics, go-to-definition) that are aware of the surrounding React and JS/TS context.
+
+Specifically, this includes:
+1.  **React Component Prop Awareness:** Autocompleting props for React components used as Pug tags (e.g., `MyComponent(propName=...)`).
+2.  **JS/TS Context in Interpolations/Attributes:** Autocompleting JavaScript/TypeScript variables, functions, and expressions within Pug interpolations (`\${myVar}`) and for attribute values that are JS expressions (e.g., `onClick=myHandler`).
+3.  **Accurate Diagnostics:** Errors in Pug syntax or type errors in the JS/TS expressions within Pug should be accurately reported at the correct location in the Pug source.
+4.  **Standard Pug Features:** Basic Pug syntax highlighting (as much as possible within a string), autocompletion for Pug tags and attributes, and Pug-specific directives.
+
+Essentially, the Pug template literal should feel like a first-class citizen for React development, as powerful and integrated as writing JSX directly.
+
+## 📜 Current State of Research & Implementation (The Pivot)
+
+The project initially started by attempting direct Pug analysis and then trying to bridge to the JS/TS context. However, to achieve the deep JSX-like experience, we have **pivoted to a new strategy inspired by Volar (for Vue) and other modern language servers that handle embedded languages by transforming them into a more analyzable intermediate representation.**
+
+**Current Strategy: Pug-to-JSX Transformation with Source Mapping**
+
+1.  **Pug-to-JSX On-the-Fly:** For each `pug\`...\`` literal found in a JS/TS file, the language server will:
+    *   Compile the Pug content into a JSX string (or AST) *in memory*. This is done using Babel programmatically with `babel-plugin-transform-react-pug`.
+    *   Crucially, this compilation step is configured to also generate **source maps** that link the generated JSX back to the original Pug source.
+2.  **Leverage TypeScript/JSX Language Services:**
+    *   The generated JSX will be treated as content within a virtual `.tsx` file.
+    *   This virtual JSX content will then be analyzed using a TypeScript language service (either by interacting with VS Code's built-in TS service via request forwarding or by embedding TS service logic directly, similar to Volar).
+    *   This allows us to get rich language features (completions, hover, diagnostics) that are fully aware of the React/JS/TS context, because the analysis is happening on JSX.
+3.  **Map Results Back to Pug:**
+    *   The diagnostics, completion edits, hover ranges, etc., received from the TS/JSX service (which are relative to the virtual JSX) must be accurately mapped back to the corresponding locations in the original Pug source within the template literal. This uses the source maps generated in step 1.
+
+**Current Code Implementation Status:**
+
+*   **Project Structure:** A VS Code extension (`vscode-react-pug-language-features`) with a client/server architecture is set up.
+*   **Pug Literal Identification (`server.ts`):** Uses Acorn to find `pug\`...\`` literals in JS/TS files.
+*   **Pug-to-JSX Transformer (`server/src/pugToJsxTransformer.ts`):**
+    *   `compilePugToJsxString()`: Implemented to take a Pug string, wrap it in a temporary JS structure, and use `@babel/core` with `babel-plugin-transform-react-pug` to generate a JSX string and request a `RawSourceMap` object from Babel.
+    *   Basic unit tests for this transformer confirm it can produce JSX and a `sourceMap` object.
+*   **JSX-to-Pug Mapping Utilities (`server/src/jsxPugMapping.ts`):**
+    *   `parseSourceMap()`: Implemented to consume a `RawSourceMap` using the `source-map` library.
+    *   `mapJsxPositionToPugPosition()`, `mapPugPositionToJsxPosition()`, `mapJsxRangeToPugRange()`: Functions are implemented to use a `SourceMapConsumer` to perform these mappings.
+    *   Basic unit tests for these utilities exist but currently use manually crafted, *oversimplified* mock source maps. They need to be updated with *real* source maps from the transformer.
+*   **Server Integration (`server.ts`):**
+    *   `validateTextDocument()` now calls `compilePugToJsxString()` for each Pug literal and logs the generated JSX and source map status. It currently still falls back to direct Pug parsing for diagnostics.
+    *   `onCompletion()` and `onHover()` are placeholders that still use the old direct Pug analysis logic. They need to be updated to use the new Pug-to-JSX -> TS Service -> Map Back Pug workflow.
+
+**🔴 Critical Unknown/Blocker:**
+The **quality, detail, and usability of the source maps generated by `babel-plugin-transform-react-pug` (via Babel) are currently the biggest unknown.** The entire JSX-centric strategy hinges on these source maps being precise enough to map character-level locations from JSX back to the original Pug source, especially around areas transformed from Pug interpolations or directives.
+
+## 📝 Detailed Plan & Instructions for Next Agent
+
+Your primary mission is to validate and complete the JSX-centric language feature pipeline.
+
+**Phase 1: Validate Source Maps & Solidify Mapping Utilities (Highest Priority)**
+
+1.  **Task: Analyze Real Source Maps from `compilePugToJsxString`**
+    *   **Instruction:** In `server/src/pugToJsxTransformer.ts` (or a dedicated test/script), invoke `compilePugToJsxString` with a variety of representative Pug snippets:
+        *   Simple tags: `p Hello`
+        *   Tags with attributes: `div.foo(id="bar" checked)`
+        *   JS Interpolations: `p Hello \${name} - \${count + 1}!`
+        *   Pug directives: `if condition\n  p True`
+        *   Multi-line structures with varied indentation.
+    *   **Instruction:** Capture the `RawSourceMap` object returned by `compilePugToJsxString` for each snippet.
+    *   **Instruction:** Meticulously inspect these `RawSourceMap` objects:
+        *   Verify `sourceMap.version`, `sourceMap.sources` (does it correctly reference your input `filename` to Babel, e.g., `source.pug.virtual.js`?), `sourceMap.sourcesContent` (does it contain the `fakeJsCode` wrapper or just the Pug?).
+        *   **Crucially, decode and analyze `sourceMap.mappings`**. Use `SourceMapConsumer.eachMapping()` from the `source-map` library to iterate over mappings. Determine if they provide character-level (or at least precise token-level) links from the generated JSX back to the original Pug string characters within the `fakeJsCode`.
+    *   **Goal:** Confirm that the source maps are detailed enough for accurate bidirectional mapping. If not, this is a major blocker. Document findings.
+
+2.  **Task: Write Robust Unit Tests for `jsxPugMapping.ts` Utilities**
+    *   **Pre-requisite:** Successful analysis from Task 1, confirming usable source maps.
+    *   **Instruction:** Update `server/src/__tests__/jsxPugMapping.test.ts`.
+    *   Remove the current simplified mock source maps. Instead, for each test case:
+        1.  Define a Pug input string.
+        2.  Use `compilePugToJsxString` to generate its JSX and its *actual* `RawSourceMap`.
+        3.  Use this real `RawSourceMap` to initialize `JsxPugSourceMapData` via `parseSourceMap()`.
+    *   **Instruction:** Write comprehensive tests for:
+        *   `mapJsxPositionToPugPosition()`: Given known corresponding points in your Pug input and generated JSX, verify correct mapping from JSX to Pug. Test boundaries, inside text, inside/around interpolations (as represented in JSX).
+        *   `mapPugPositionToJsxPosition()`: Verify correct mapping from Pug to JSX for various points.
+        *   `mapJsxRangeToPugRange()`: Test with ranges in JSX (e.g., a JSX tag, a JS expression in JSX) and verify the mapped Pug range is correct.
+    *   **Coverage:** Aim for high unit test coverage (e.g., >80%) for these critical mapping utilities.
+    *   **Goal:** Ensure your mapping functions correctly interpret the real source maps.
+
+3.  **Task: Refine `jsxPugMapping.ts` based on Test Results**
+    *   **Instruction:** Debug and fix any issues in your mapping functions (`mapJsxPositionToPugPosition`, `mapPugPositionToJsxPosition`, `mapJsxRangeToPugRange`) until all unit tests pass.
+    *   **Instruction:** If tests reveal fundamental issues with the source map data itself (e.g., lack of precision from Babel/plugin), document these limitations. It might require revisiting Step 1 (e.g., exploring Babel options, or if the plugin needs modification for better source maps – this would be a significant research task).
+    *   **Goal:** Highly reliable JSX <-> Pug mapping utilities.
+
+**Phase 2: Implement LSP Features using JSX and Mapping**
+
+4.  **Task: Implement Diagnostics via JSX**
+    *   **Instruction:** In `server.ts -> validateTextDocument()`:
+        1.  After compiling Pug to JSX, if successful:
+        2.  Create content for a virtual `.tsx` file. This should include the generated JSX. **Crucially, try to include relevant imports from the original JS/TS file to provide context to the TS service.** (This is complex; start simple, perhaps no imports initially, and enhance later).
+        3.  Use a TypeScript Language Service instance (see Plan Step 4, Option A/B research for how to set this up – embedding `ts.createLanguageService` is preferred for control) to get diagnostics for this virtual `.tsx` content.
+        4.  For each diagnostic received (its range is in JSX coordinates), use your validated `mapJsxRangeToPugRange()` to convert its range back to the original Pug literal's coordinates in the document.
+        5.  Collect these mapped diagnostics and send them to the client.
+        6.  Remove the old fallback direct Pug parsing diagnostics.
+    *   **Unit Test:** Mock the TS Language Service to return predefined JSX diagnostics for a given virtual JSX input. Verify that `validateTextDocument` correctly maps these back to expected Pug ranges.
+    *   **Goal:** Diagnostics (e.g., invalid JSX, type errors in expressions within JSX) appear accurately on the Pug source.
+
+5.  **Task: Implement Completions via JSX**
+    *   **Instruction:** In `server.ts -> onCompletion()`:
+        1.  Identify the current Pug literal and cursor position.
+        2.  Compile the Pug to JSX and get the source map data.
+        3.  Use `mapPugPositionToJsxPosition()` to map the Pug cursor position to a corresponding position in the virtual JSX.
+        4.  If mapping is successful, request completions from the TS Language Service for the virtual JSX at the mapped position.
+        5.  For each completion item received (which is JSX-based):
+            *   If it has a `TextEdit`, map its range from JSX coordinates back to Pug coordinates using `mapJsxRangeToPugRange()`.
+            *   The `insertText` or `newText` might also need transformation if it's JSX syntax that has a different Pug equivalent (this is advanced; initially, direct insertion of text might be okay for simple values).
+        6.  Return the (mapped) completion list.
+    *   **Unit Test:** Mock TS service completions. Test that Pug cursor positions correctly map to JSX, and that completion edits are mapped back.
+    *   **Goal:** JSX-aware completions (e.g., for component props, JS expressions) are offered when editing Pug, with edits applied correctly.
+
+6.  **Task: Implement Hover via JSX**
+    *   **Instruction:** In `server.ts -> onHover()`:
+        1.  Similar flow: Map Pug cursor to JSX position.
+        2.  Request hover information from the TS Language Service for the virtual JSX.
+        3.  If the hover result includes a range, map it from JSX back to Pug.
+        4.  Return the (mapped) hover result.
+    *   **Unit Test:** Mock TS service hover results. Test mapping.
+    *   **Goal:** Hovering over elements in Pug (that become specific JSX constructs) shows rich information derived from TS/JSX analysis.
+
+**Phase 3: Refinement and Further Features**
+
+7.  **Task: Enhance Context for Virtual JSX Documents**
+    *   **Instruction:** Improve the content generation for virtual `.tsx` files. This includes more robustly parsing the original JS/TS file to extract imports and potentially relevant surrounding scope variables/types to make the TS Language Service analysis more accurate. This is an ongoing refinement.
+
+8.  **Task: Advanced Features (as time permits)**
+    *   Go-to-definition (from Pug component usage to its JS/TS definition via JSX).
+    *   Formatting (very complex due to bidirectional mapping of format changes).
+
+9.  **Task: Performance, Robustness, and Extensive Manual Testing**
+    *   Profile and optimize the Pug-to-JSX and mapping steps.
+    *   Improve error handling for compilation and mapping failures.
+    *   Conduct extensive manual testing with diverse real-world React projects.
+
+10. **Task: Update README.md** with new features, setup, and known limitations.
+
+**Important Considerations for the Agent:**
+*   **Unit Test First:** For each new piece of mapping logic or LSP feature integration, write unit tests *first* or alongside development. Ensure high coverage for `jsxPugMapping.ts`.
+*   **Source Map Quality is Key:** If Task 1 reveals that the source maps from `babel-plugin-transform-react-pug` are insufficient, you **must stop and re-evaluate**. This might involve a research spike into either augmenting that plugin, finding an alternative Pug-to-JSX-with-maps solution, or (as a last resort) abandoning the JSX-centric approach for certain features.
+*   **Iterative Approach:** Don't try to perfect everything at once. Get a basic end-to-end flow working for one feature (e.g., diagnostics via JSX), then refine its mapping accuracy, then move to the next feature.
+
+This detailed prompt should provide a clear path forward. Good luck!
+---
+
+This `AGENTS.MD` outlines the strategic pivot, the current (very early) state of that pivot, and a detailed, test-driven plan for the next agent to continue development towards the JSX-like editing experience.
