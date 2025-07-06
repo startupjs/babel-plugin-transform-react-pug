@@ -406,6 +406,11 @@ connection.onCompletion(
         }
 
         const jsxPosition = mapPugPositionToJsxPosition(cursorPugPosition, mapData);
+
+        // If jsxPosition is null, mapData is not needed further for this path.
+        // However, if jsxPosition is valid, mapData will be needed for TextEdits.
+        // So, defer destroying mapData until after processing completions or if jsxPosition is null.
+
         if (!jsxPosition) {
           destroySourceMapData(mapData);
           continue;
@@ -421,24 +426,26 @@ export default PugComponent;
         const jsxOffset = positionToOffset(virtualTsxContent, jsxPosition);
 
         const tsCompletions = tsLangService.getCompletionsAtPosition(virtualTsxFilename, jsxOffset, undefined);
-        destroySourceMapData(mapData);
+
+        // Note: mapData is NOT destroyed here yet. It's needed for TextEdits below.
 
         if (!tsCompletions || !tsCompletions.entries) {
+          destroySourceMapData(mapData); // Destroy if no completions to process
           return null;
         }
 
         const lspCompletionItems: CompletionItem[] = [];
-        const tsProgram = tsLangService.getProgram(); // Get program once for performance if using sourceFile from it
+        const tsProgram = tsLangService.getProgram();
 
         for (const entry of tsCompletions.entries) {
           const details = tsLangService.getCompletionEntryDetails(
             virtualTsxFilename,
             jsxOffset,
             entry.name,
-            undefined, // formatOptions
-            entry.source, // source for auto-imports
-            undefined, // preferences
-            entry.data // data from entry
+            undefined,
+            entry.source,
+            undefined,
+            entry.data
           );
 
           const lspItem: CompletionItem = {
@@ -446,18 +453,14 @@ export default PugComponent;
             kind: mapTsCompletionKindToLspKind(entry.kind),
             detail: details?.displayParts ? displayPartsToString(details.displayParts) : undefined,
             documentation: details?.documentation ? displayPartsToString(details.documentation) : undefined,
-            // sortText: entry.sortText, // Consider adding if TS provides useful sortText
-            // data: entry.data // Pass along data for potential resolve step if ever implemented
           };
 
           if (details?.codeActions && details.codeActions.length > 0) {
-            // Assuming the first codeAction and its first change are the primary edit.
-            // Real-world scenarios might need more sophisticated logic to pick the right action/change.
             const firstAction = details.codeActions[0];
             if (firstAction.changes.length > 0) {
-              const firstFileTextChange = firstAction.changes[0]; // ts.FileTextChanges
+              const firstFileTextChange = firstAction.changes[0];
               if (firstFileTextChange.fileName === virtualTsxFilename && firstFileTextChange.textChanges.length > 0) {
-                const tsTextChange = firstFileTextChange.textChanges[0]; // ts.TextChange (usually one for a completion)
+                const tsTextChange = firstFileTextChange.textChanges[0];
 
                 const jsxSourceFile = tsProgram?.getSourceFile(virtualTsxFilename);
                 if (jsxSourceFile) {
@@ -465,9 +468,8 @@ export default PugComponent;
                   const endLoc = ts.getLineAndCharacterOfPosition(jsxSourceFile, tsTextChange.span.start + tsTextChange.span.length);
                   const jsxRange = Range.create(startLoc.line, startLoc.character, endLoc.line, endLoc.character);
 
-                  // Use the mapData obtained earlier for this literal.
-                  // No need to re-parse, ensure mapData is not destroyed prematurely.
-                  const pugRange = mapJsxRangeToPugRange(jsxRange, mapData); // Use existing mapData
+                  // Use the original mapData obtained for this literal
+                  const pugRange = mapJsxRangeToPugRange(jsxRange, mapData);
                   if (pugRange) {
                     const docRelativePugRange = Range.create(
                       literal.contentRange.start.line + pugRange.start.line,
@@ -475,9 +477,6 @@ export default PugComponent;
                       literal.contentRange.start.line + pugRange.end.line,
                       (pugRange.end.line === 0 ? literal.contentRange.start.character : 0) + pugRange.end.character
                     );
-
-                    // TODO: Transform tsTextChange.newText (JSX) to Pug syntax if necessary.
-                    // For now, using it as-is. This will be incorrect for JSX tags.
                     lspItem.textEdit = TextEdit.replace(docRelativePugRange, tsTextChange.newText);
                   }
                 }
@@ -486,8 +485,8 @@ export default PugComponent;
           }
           lspCompletionItems.push(lspItem);
         }
-        // Destroy mapData after processing all completion entries for this literal
-        destroySourceMapData(mapData);
+
+        destroySourceMapData(mapData); // Destroy mapData after all entries and their details are processed
         return lspCompletionItems;
       }
     }
