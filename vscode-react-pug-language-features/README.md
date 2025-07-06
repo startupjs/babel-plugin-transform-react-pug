@@ -2,13 +2,28 @@
 
 Provides language support for [Pug](https://pugjs.org/) tagged template literals within React components in JavaScript and TypeScript files. This extension aims to offer an editing experience consistent with tools like [startupjs/babel-plugin-transform-react-pug](https://github.com/startupjs/babel-plugin-transform-react-pug).
 
-## Features (Planned & In Development)
+## Features
 
-*   **Syntax Highlighting:** Leverages existing JavaScript/TypeScript highlighting, with plans to explore specific highlighting for Pug syntax within the literals if feasible. (Note: True semantic highlighting for Pug inside JS/TS requires more advanced VS Code features or integration with a tokenizer that understands embedded languages).
-*   **Diagnostics/Error Checking:** Identifies Pug syntax errors within `pug\`...\`` template literals.
-*   **Autocompletion:** Offers completions for Pug tags, attributes, and potentially dynamic values based on your Pug code.
-*   **Hover Information:** (Planned) Show information for Pug elements.
-*   **Formatting:** (Planned) Format Pug code within the template literals.
+*   **Pug Literal Detection:** Automatically identifies `pug\`...\`` template literals in your JavaScript (`.js`, `.jsx`) and TypeScript (`.ts`, `.tsx`) files.
+*   **Diagnostics/Error Checking:**
+    *   Displays syntax errors from the Pug parser (`@startupjs/pug-lexer`, `pug-parser`) directly in your editor.
+    *   *(Limitation: Position mapping for error highlighting is currently approximate and will be refined).*
+*   **Autocompletion (Basic):**
+    *   Provides completions for common Pug tags (e.g., `div`, `p`, `span`).
+    *   Offers snippets for Pug directives (e.g., `if`, `else`, `each`).
+    *   *(Limitation: Context-awareness and attribute completions are planned. Position mapping for insertions is currently approximate).*
+*   **Hover Information (Basic):**
+    *   Shows basic information when hovering over Pug tags and directives.
+    *   Displays the original JavaScript expression when hovering over its placeholder within the Pug structure.
+    *   *(Limitation: The highlighted range for hover information is currently approximate).*
+*   **Syntax Highlighting:** Relies on VS Code's built-in JavaScript/TypeScript syntax highlighting for the template literal content. True semantic highlighting for the embedded Pug syntax is a more advanced feature for future consideration.
+
+### Planned Features:
+*   Accurate position mapping for all features.
+*   Context-aware autocompletions (e.g., attributes for specific tags).
+*   More detailed hover information (e.g., attribute details, Pug variable information).
+*   Go-to-definition (e.g., for mixins, if supported).
+*   Formatting of Pug code within the template literals.
 
 ## Installation
 
@@ -143,9 +158,17 @@ If you'd like to contribute or build the extension locally:
 
 ## Known Issues & Limitations (Current State)
 
-*   This extension is in early development. Many planned features are not yet fully implemented.
-*   Advanced handling of JavaScript interpolations (`${...}`) for providing rich TypeScript/JavaScript language features *within* the interpolations is complex and will be developed iteratively. Initially, the focus is on the Pug syntax itself.
-*   Syntax highlighting for the Pug code within the template literals relies on VS Code's default JavaScript/TypeScript string highlighting. True semantic highlighting for the embedded Pug is a more complex feature.
+*   **Position Mapping Accuracy:** This is the most significant current limitation. The conversion of positions and ranges between the main JavaScript/TypeScript document and the internal "pure Pug" representation (used for parsing) is currently **approximate**. This means:
+    *   Diagnostic squiggles might not perfectly align with the erroneous Pug code.
+    *   Completion items might be offered based on a slightly incorrect cursor context, and text edits from completions (if they were used) could be misaligned.
+    *   The highlighted range for hover information might be imprecise.
+    *   **This is the highest priority for refinement in upcoming development.**
+*   **Context-Awareness for Completions & Hover:** Current completions and hover information are basic (e.g., static list of tags, simple messages). They do not yet deeply analyze the Pug AST for context (e.g., offering specific attributes for a tag, or type information).
+*   **JavaScript Interpolation Features:** While placeholders for JS interpolations (`${...}`) are recognized and can be hovered to see the original expression, there is no specific language support (like TS type checking or autocompletion) *within* these JS expressions themselves. This is a complex feature planned for later.
+*   **Complex Pug Structures & Interpolations:** The current regex-based approach for identifying JS interpolations in `reactPugLanguageService.ts` might have issues with very complex or nested JS expressions, or with unusual string escaping within the Pug.
+*   **Syntax Highlighting:** As mentioned in "Features", syntax highlighting for the Pug code within template literals relies on VS Code's default JavaScript/TypeScript string highlighting. True semantic highlighting for the embedded Pug requires more advanced integration.
+*   **Formatting:** Not yet implemented.
+*   **Limited Error Recovery in Parser:** The underlying Pug parser might not have extensive error recovery, so one syntax error could potentially impact the parsing of subsequent Pug code in the same literal.
 
 ## Contributing
 

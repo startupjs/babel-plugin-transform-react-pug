@@ -1,0 +1,28 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Launch Client",
+      "type": "extensionHost",
+      "request": "launch",
+      "args": ["--extensionDevelopmentPath=${workspaceFolder}"],
+      "outFiles": ["${workspaceFolder}/client/out/**/*.js"],
+      "preLaunchTask": "npm: compile", // Assumes an npm script "compile" exists
+      "internalConsoleOptions": "openOnSessionStart"
+    },
+    {
+      "name": "Attach to Server",
+      "type": "node",
+      "request": "attach",
+      "port": 6009, // Must match the --inspect port in client/src/extension.ts debugOptions
+      "restart": true,
+      "outFiles": ["${workspaceFolder}/server/out/**/*.js"],
+      "internalConsoleOptions": "openOnSessionStart"
+    },
+    {
+      "name": "Client + Server",
+      "configurations": ["Launch Client", "Attach to Server"],
+      "stopAll": true
+    }
+  ]
+}
