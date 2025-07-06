@@ -1,0 +1,33 @@
+.vscode/**
+.vscode-test/**
+client/src/**
+client/node_modules/**
+server/src/**
+server/node_modules/**
+tsconfig.json
+tsconfig.base.json
+client/tsconfig.json
+server/tsconfig.json
+# Common development files
+.git*
+*.md
+*.yml
+*.yaml
+yarn.lock
+package-lock.json
+# Exclude test files if any are added outside of src/test eventually
+# **/*.test.ts
+
+# Compiled output from client and server should be included,
+# so we don't ignore client/out and server/out.
+
+# Node modules for the extension itself (at the root) are bundled by vsce
+# but client/server node_modules should not be included if their dependencies
+# are bundled or if they are devDependencies only.
+# For now, assume client/server dependencies will be bundled or are lightweight.
+# If server has heavy native deps, different strategy needed.
+
+# Keep source maps if useful for debugging, but often excluded for release.
+# For now, keep them.
+# !client/out/**/*.map
+# !server/out/**/*.map

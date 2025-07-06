@@ -1,0 +1,17 @@
+{
+  "name": "vscode-react-pug-language-features-client",
+  "description": "Client part of the React Pug Language Features VS Code extension.",
+  "license": "MIT",
+  "version": "0.0.1",
+  "publisher": "jules-ai-developer",
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.80.0",
+    "typescript": "^5.0.0"
+  }
+}

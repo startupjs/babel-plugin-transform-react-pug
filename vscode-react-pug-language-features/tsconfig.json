@@ -1,0 +1,16 @@
+{
+  "compilerOptions": {
+    "sourceMap": true, // Keep for overall build process if useful
+    "strict": true,    // Keep for overall build process if useful
+    "composite": true, // Essential for project references
+    "esModuleInterop": true, // Good to have consistent
+    "forceConsistentCasingInFileNames": true // Good to have consistent
+    // Removed: module, target, lib, rootDir, declaration
+  },
+  "exclude": ["node_modules", ".vscode-test"],
+  "references": [
+    { "path": "./client" },
+    { "path": "./server" }
+  ],
+  "files": [] // No files here, they are in client/server - this tells tsc it's an orchestrator
+}

@@ -1,0 +1,58 @@
+{
+  "name": "vscode-react-pug-language-features",
+  "displayName": "React Pug Language Features",
+  "description": "Language support for Pug tagged template literals in React (JavaScript/TypeScript).",
+  "version": "0.0.1",
+  "publisher": "jules-ai-developer",
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Linters",
+    "Snippets"
+  ],
+  "activationEvents": [
+    "onLanguage:javascript",
+    "onLanguage:typescript",
+    "onLanguage:javascriptreact",
+    "onLanguage:typescriptreact"
+  ],
+  "main": "./client/out/extension.js",
+  "contributes": {
+    "configuration": {
+      "title": "React Pug Language Features",
+      "properties": {
+        "reactPug.trace.server": {
+          "scope": "window",
+          "type": "string",
+          "enum": [
+            "off",
+            "messages",
+            "verbose"
+          ],
+          "default": "off",
+          "description": "Traces the communication between VS Code and the React Pug language server."
+        },
+        "reactPug.classAttribute": {
+          "scope": "resource",
+          "type": "string",
+          "default": "className",
+          "description": "The attribute name to use for CSS classes when transforming Pug (e.g., 'className' or 'styleName'). Aligns with babel-plugin-transform-react-pug option."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -b tsconfig.json",
+    "watch": "tsc -b tsconfig.json -w",
+    "postinstall": "cd client && npm install && cd ../server && npm install && cd ..",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.80.0",
+    "@types/node": "^18.x.x",
+    "typescript": "^5.0.0"
+  }
+}
