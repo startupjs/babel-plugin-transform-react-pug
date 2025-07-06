@@ -22,21 +22,23 @@ export interface InterpolationMapping {
 
 // Detailed information about transformations applied during preprocessing
 export interface PugPreprocessingData {
-  originalRawPugContent: string; // The raw pug content as passed to preprocessPug
-  baseIndentationLength: number; // Length of indentation stripped for the whole block first
-  contentIndentationLength: number; // Length of common content indentation stripped next
-  // Stores mapping for each line from its state after base/content indent stripping to purePugContent
-  // Each entry: { originalLine: number, pureLine: number, charOffsetDelta: number (due to interpolations on this line up to a point) }
-  // This might be too complex; a segment-based approach is better.
-
-  // Segment-based mapping: Describes parts of rawPug (post-indent) and their purePug counterparts
+  originalRawPugContent: string;
+  baseIndentationLength: number;
+  contentIndentationLength: number;
+  textAfterContentIndentStripping: string; // Store this intermediate string explicitly
+  lineMaps: Array<{
+    originalLineNumberInRawLiteral: number; // 0-indexed line in rawPugContent (the block from the editor)
+    lineInTAS: number; // 0-indexed line in textAfterContentIndentStripping
+    originalLeadingWhitespaceLength: number; // Total whitespace stripped (base + content) for this line
+    // lengthOfLineInTAS: number; // Length of this line in textAfterContentIndentStripping
+  }>;
   segments: Array<{
     type: 'direct' | 'interpolation';
-    originalStartOffset: number; // Offset in rawPugContent (after base and content indent stripping)
-    originalEndOffset: number;
-    purePugStartOffset: number; // Offset in purePugContent
+    originalStartOffset: number; // Offset in textAfterContentIndentStripping
+    originalEndOffset: number;   // Offset in textAfterContentIndentStripping
+    purePugStartOffset: number;
     purePugEndOffset: number;
-    interpolation?: InterpolationMapping; // if type is 'interpolation'
+    interpolation?: InterpolationMapping;
   }>;
 }
 
@@ -44,16 +46,13 @@ export interface PugPreprocessingData {
 // Output of the preprocessing step
 export interface PreprocessedPug {
   purePugContent: string;
-  interpolations: InterpolationMapping[]; // Detailed info for each interpolation
-  mappingData: PugPreprocessingData; // Data needed for robust position mapping
+  interpolations: InterpolationMapping[];
+  mappingData: PugPreprocessingData;
   parseErrors: Diagnostic[];
 }
 
 // Output of the parsing step
-export interface ParsedPug extends Omit<PreprocessedPug, 'mappingData'> { // mappingData might not be needed by all consumers of ParsedPug directly
-  // We might still want mappingData here if validation/completion needs it to adjust things.
-  // For now, let's keep it.
-  mappingData: PugPreprocessingData;
+export interface ParsedPug extends PreprocessedPug { // Keep mappingData for now
   pugAst?: pugParser.Node; // The Pug AST if parsing was successful (or partially successful)
   // Parse errors from pug-parser will be added to `parseErrors`
 }
@@ -61,7 +60,18 @@ export interface ParsedPug extends Omit<PreprocessedPug, 'mappingData'> { // map
 
 import { Diagnostic, Range, Position, DiagnosticSeverity, CompletionItem, CompletionList, CompletionItemKind, TextEdit, Hover, MarkupContent, MarkupKind } from 'vscode-languageserver/node';
 
-// ... (other imports remain the same)
+import { Diagnostic, Range, Position, DiagnosticSeverity, CompletionItem, CompletionList, CompletionItemKind, TextEdit, Hover, MarkupContent, MarkupKind } from 'vscode-languageserver/node';
+import { TextDocument } from 'vscode-languageserver-textdocument';
+import * as pugLexer from '@startupjs/pug-lexer';
+import * as pugParser from 'pug-parser';
+// import P speziellen from 'pug-error'; // Corrected import name if this was intended, or remove if not used directly
+import commonPrefix from 'common-prefix';
+// import he from 'he'; // Not actively used yet
+
+import { offsetToPosition } from './utils/textPositions'; // Import the new helper
+
+// ... (other interface definitions remain the same)
+
 
 export interface IReactPugLanguageService {
   preprocessPug(rawPugContent: string, baseIndentation: string, documentUri: string): PreprocessedPug;
@@ -81,53 +91,76 @@ function createReactPugLanguageService(settings: ReactPugSettings): IReactPugLan
 
   function preprocessPug(rawPugContent: string, baseIndentationString: string, documentUri: string): PreprocessedPug {
     const parseErrors: Diagnostic[] = [];
-    interpolationCounter = 0; // Reset for each preprocessing run
+    interpolationCounter = 0;
+    const lineMaps: PugPreprocessingData['lineMaps'] = [];
 
-    // Stage 1: Indentation Normalization
-    // First, remove the base indentation of the pug`` block itself.
-    let lines = rawPugContent.split('\n');
+    // Stage 1: Indentation Normalization & Line Mapping
+    const originalLines = rawPugContent.split('\n');
     const baseIndentationLength = baseIndentationString.length;
 
-    let contentAfterBaseIndent = lines.map(line => {
-        // Only strip baseIndentation if the line actually starts with it.
-        // Otherwise, keep the line as is (it might be an empty line or incorrectly indented).
-        return line.startsWith(baseIndentationString) ? line.substring(baseIndentationLength) : line;
-    }).join('\n');
+    const linesAfterBaseIndent: string[] = [];
+    originalLines.forEach((line, index) => {
+      if (line.startsWith(baseIndentationString)) {
+        linesAfterBaseIndent.push(line.substring(baseIndentationLength));
+      } else if (line.trim() === '') { // Keep empty lines as they are (don't strip base from them if they don't have it)
+        linesAfterBaseIndent.push(line);
+      } else { // Line doesn't have base indent but isn't empty - could be an error or mixed indent
+        linesAfterBaseIndent.push(line);
+        // Consider adding a diagnostic here for inconsistent base indentation if strictness is desired
+      }
+    });
 
-    // Second, find and remove common leading whitespace from the *content* lines.
-    const contentLines = contentAfterBaseIndent.split('\n');
-    const nonEmptyContentLines = contentLines.filter(line => line.trim() !== '');
+    const nonEmptyContentLines = linesAfterBaseIndent.filter(line => line.trim() !== '');
     const commonContentIndent = nonEmptyContentLines.length > 0 ? commonPrefix(nonEmptyContentLines.map(line => /^[ \t]*/.exec(line)?.[0] || '')) : '';
     const contentIndentationLength = commonContentIndent.length;
 
-    let textAfterContentIndentStripping = contentLines.map(line => {
-        return line.startsWith(commonContentIndent) ? line.substring(contentIndentationLength) : line;
-    }).join('\n');
+    const finalStrippedLines: string[] = [];
+    linesAfterBaseIndent.forEach((line, originalLineIndexOffset) => { // originalLineIndexOffset is line in linesAfterBaseIndent
+        let strippedLine = line;
+        let currentLineOriginalWSLength = 0;
+
+        if (line.startsWith(baseIndentationString)) { // This check is on originalLines logic, effectively
+            currentLineOriginalWSLength += baseIndentationLength;
+        }
+
+        if (line.startsWith(commonContentIndent)) { // This check is on line from linesAfterBaseIndent
+            strippedLine = line.substring(contentIndentationLength);
+            currentLineOriginalWSLength += contentIndentationLength;
+            // Note: This assumes commonContentIndent is *additional* to baseIndentation for lines that had both.
+            // If commonContentIndent *includes* baseIndentation, logic would differ.
+            // The current commonPrefix is on lines *after* base was stripped, so this is additive.
+        } else if (line.trim() !== '' && contentIndentationLength > 0) {
+             // Line does not have the common content indent but is not empty.
+             // This might be an inconsistent indentation within the block.
+             // For mapping, we treat it as if no *content* indent was stripped from this specific line.
+        }
+        finalStrippedLines.push(strippedLine);
+        lineMaps.push({
+            originalLineNumberInRawLiteral: originalLineIndexOffset, // This is line in rawPugContent passed to function
+            lineInTAS: originalLineIndexOffset, // Line number is preserved till interpolation stage
+            originalLeadingWhitespaceLength: currentLineOriginalWSLength, // Total stripped for *this* line
+        });
+    });
+    const textAfterContentIndentStripping = finalStrippedLines.join('\n');
 
     // Stage 2: Handle JavaScript Interpolations and Build Segments
     const interpolations: InterpolationMapping[] = [];
     const segments: PugPreprocessingData['segments'] = [];
     let finalPurePugContent = "";
-    let lastIndexOriginal = 0; // Tracks position in textAfterContentIndentStripping
+    let lastIndexOriginalTAS = 0; // Tracks position in textAfterContentIndentStripping
     let currentPurePugOffset = 0;
 
-    // Regex to find ${...}. This needs to be robust for nested braces, strings etc.
-    // Using a simplified one for now, assuming non-nested simple expressions.
-    // A proper JS parser for expressions would be much better.
-    const interpolationRegex = /\$\{((?:[^\{\}]|\{[^}]*\})+)\}/g;
-
+    const interpolationRegex = /\$\{((?:[^\{\}]|\{[^}]*\})+)\}/g; // Simplified regex
 
     let match;
     while ((match = interpolationRegex.exec(textAfterContentIndentStripping)) !== null) {
-      const originalExpression = match[1]; // Content between ${ and }
-      const fullMatch = match[0]; // Full ${...}
+      const originalExpression = match[1];
 
-      // Add direct segment before interpolation
-      if (match.index > lastIndexOriginal) {
-        const textSegment = textAfterContentIndentStripping.substring(lastIndexOriginal, match.index);
+      if (match.index > lastIndexOriginalTAS) {
+        const textSegment = textAfterContentIndentStripping.substring(lastIndexOriginalTAS, match.index);
         segments.push({
           type: 'direct',
-          originalStartOffset: lastIndexOriginal,
+          originalStartOffset: lastIndexOriginalTAS,
           originalEndOffset: match.index,
           purePugStartOffset: currentPurePugOffset,
           purePugEndOffset: currentPurePugOffset + textSegment.length,
@@ -136,45 +169,42 @@ function createReactPugLanguageService(settings: ReactPugSettings): IReactPugLan
         currentPurePugOffset += textSegment.length;
       }
 
-      // Handle interpolation
       const placeholder = `${INTERPOLATION_PLACEHOLDER_PREFIX}${interpolationCounter++}_`;
-      const originalStartOffsetInPostIndent = match.index;
-      const originalEndOffsetInPostIndent = interpolationRegex.lastIndex;
+      const originalStartOffsetInTAS = match.index;
+      const originalEndOffsetInTAS = interpolationRegex.lastIndex;
 
-      // For ranges, we need to convert offsets to Line/Character positions
-      // This should be done by the caller or a utility, using textAfterContentIndentStripping
-      // For now, store offsets. The actual Range objects can be computed later if needed by mapping utilities.
-      // Let's assume for `InterpolationMapping` we store offsets for now.
-      // TODO: Convert these offsets to Range objects if the interface demands.
-      // For simplicity, `originalRangeInRawLiteral` and `placeholderRangeInPurePug` will be simplified.
       const currentInterpolation: InterpolationMapping = {
         placeholder,
         originalExpression,
-        // These ranges are placeholders and need accurate calculation based on `textAfterContentIndentStripping`
-        originalRangeInRawLiteral: Range.create(0, originalStartOffsetInPostIndent, 0, originalEndOffsetInPostIndent), // Incorrect line
-        placeholderRangeInPurePug: Range.create(0, currentPurePugOffset, 0, currentPurePugOffset + placeholder.length) // Incorrect line
+        originalRangeInRawLiteral: Range.create( // This range is in textAfterContentIndentStripping coordinates
+          offsetToPosition(textAfterContentIndentStripping, originalStartOffsetInTAS),
+          offsetToPosition(textAfterContentIndentStripping, originalEndOffsetInTAS)
+        ),
+        placeholderRangeInPurePug: Range.create(
+          offsetToPosition(finalPurePugContent, currentPurePugOffset),
+          offsetToPosition(finalPurePugContent + placeholder, currentPurePugOffset + placeholder.length)
+        )
       };
       interpolations.push(currentInterpolation);
 
       segments.push({
         type: 'interpolation',
-        originalStartOffset: originalStartOffsetInPostIndent,
-        originalEndOffset: originalEndOffsetInPostIndent,
+        originalStartOffset: originalStartOffsetInTAS,
+        originalEndOffset: originalEndOffsetInTAS,
         purePugStartOffset: currentPurePugOffset,
         purePugEndOffset: currentPurePugOffset + placeholder.length,
         interpolation: currentInterpolation
       });
       finalPurePugContent += placeholder;
       currentPurePugOffset += placeholder.length;
-      lastIndexOriginal = interpolationRegex.lastIndex;
+      lastIndexOriginalTAS = interpolationRegex.lastIndex;
     }
 
-    // Add remaining direct segment
-    if (lastIndexOriginal < textAfterContentIndentStripping.length) {
-      const textSegment = textAfterContentIndentStripping.substring(lastIndexOriginal);
+    if (lastIndexOriginalTAS < textAfterContentIndentStripping.length) {
+      const textSegment = textAfterContentIndentStripping.substring(lastIndexOriginalTAS);
       segments.push({
         type: 'direct',
-        originalStartOffset: lastIndexOriginal,
+        originalStartOffset: lastIndexOriginalTAS,
         originalEndOffset: textAfterContentIndentStripping.length,
         purePugStartOffset: currentPurePugOffset,
         purePugEndOffset: currentPurePugOffset + textSegment.length,
@@ -182,12 +212,12 @@ function createReactPugLanguageService(settings: ReactPugSettings): IReactPugLan
       finalPurePugContent += textSegment;
     }
 
-    // TODO: Handle unclosed interpolations or other preprocessing errors and add to parseErrors.
-
     const mappingData: PugPreprocessingData = {
-      originalRawPugContent: rawPugContent, // The initial raw content
+      originalRawPugContent: rawPugContent,
       baseIndentationLength,
       contentIndentationLength,
+      textAfterContentIndentStripping, // Store this
+      lineMaps, // Store this
       segments
     };
 
@@ -270,13 +300,53 @@ function createReactPugLanguageService(settings: ReactPugSettings): IReactPugLan
     // and the `positionInPurePug`.
 
     // Example: If typing at the start of a line or after a space, suggest tags.
-    // This is a very simplified context check.
-    const lineContentBeforeCursor = parsedResult.purePugContent.split('\\n')[positionInPurePug.line]?.substring(0, positionInPurePug.character);
+    const { purePugContent, pugAst } = parsedResult;
+    const items: CompletionItem[] = [];
 
-    if (lineContentBeforeCursor === undefined) return null; // Should not happen if position is valid
+    // Get text on the current line up to the cursor
+    const currentLine = purePugContent.split('\n')[positionInPurePug.line] || "";
+    const linePrefix = currentLine.substring(0, positionInPurePug.character);
 
-    // Only offer completions if at the start of a "word" or line start
-    if (lineContentBeforeCursor.match(/(^|\s)$/)) {
+    // Simplistic context checking for attribute completion
+    // e.g., "div(" or "input(" or "div(type="text" " <-- space after an attribute
+    const attributeContextMatch = linePrefix.match(/([\w-]+)\s*\(\s*([\w-]+\s*=\s*("[^"]*"|'[^']*'|[\w-]+)\s*,\s*)*([\w-]*)$/);
+    // थोड़ा और बेहतर Context check: tagName(attr1="val1", attr2=val2, partialAttr <-- here
+    const betterAttributeContextMatch = linePrefix.match(/([\w-]+)\s*\(([^)]*)$/);
+
+
+    if (betterAttributeContextMatch) {
+        const tagName = betterAttributeContextMatch[1];
+        const existingAttrsString = betterAttributeContextMatch[2];
+        const charAfterLastAttr = existingAttrsString.match(/,\s*$/) || existingAttrsString.trim() === '' || existingAttrsString.endsWith('(');
+
+        // Only suggest attributes if we are clearly in the attribute list parentheses
+        // and either at the start, or after a comma and optional space.
+        if (charAfterLastAttr || existingAttrsString.match(/[\w-]$/)) { // also if typing an attribute name
+            // Common HTML attributes (very basic list)
+            const commonAttributes: CompletionItem[] = [
+                { label: 'id', kind: CompletionItemKind.Property, detail: 'Specifies a unique id for an element' },
+                { label: 'class', kind: CompletionItemKind.Property, detail: 'Specifies one or more classnames for an element' },
+                { label: 'style', kind: CompletionItemKind.Property, detail: 'Specifies an inline CSS style for an element' },
+                { label: 'title', kind: CompletionItemKind.Property, detail: 'Specifies extra information about an element' },
+            ];
+            // Tag-specific attributes (example for 'input')
+            const inputAttributes: CompletionItem[] = [
+                { label: 'type', kind: CompletionItemKind.Property, detail: 'Specifies the type of an <input> element' },
+                { label: 'value', kind: CompletionItemKind.Property, detail: 'Specifies the value of an <input> element' },
+                { label: 'placeholder', kind: CompletionItemKind.Property, detail: 'Specifies a short hint that describes the expected value of an input field' },
+                { label: 'name', kind: CompletionItemKind.Property, detail: 'Specifies the name of an <input> element' },
+            ];
+
+            items.push(...commonAttributes);
+            if (tagName === 'input') {
+                items.push(...inputAttributes);
+            }
+            // TODO: Prevent suggesting already existing attributes.
+        }
+    }
+
+    // Offer tag completions if at the start of a "word" or line start, and not in attribute context
+    if (linePrefix.match(/(^|\s)([\w-]*)$/) && !betterAttributeContextMatch) {
       const commonPugTags: CompletionItem[] = [
         { label: 'div', kind: CompletionItemKind.Keyword, detail: 'HTML <div> tag' },
         { label: 'p', kind: CompletionItemKind.Keyword, detail: 'HTML <p> tag' },
@@ -293,15 +363,117 @@ function createReactPugLanguageService(settings: ReactPugSettings): IReactPugLan
         { label: 'textarea', kind: CompletionItemKind.Keyword, detail: 'HTML <textarea> tag' },
         { label: 'label', kind: CompletionItemKind.Keyword, detail: 'HTML <label> tag' },
         { label: 'form', kind: CompletionItemKind.Keyword, detail: 'HTML <form> tag' },
-        { label: 'if', kind: CompletionItemKind.Snippet, detail: 'Pug conditional: if condition' , insertText: 'if ${1:condition}\\n  '},
-        { label: 'else if', kind: CompletionItemKind.Snippet, detail: 'Pug conditional: else if condition', insertText: 'else if ${1:condition}\\n  '},
-        { label: 'else', kind: CompletionItemKind.Snippet, detail: 'Pug conditional: else', insertText: 'else\\n  '},
-        { label: 'each', kind: CompletionItemKind.Snippet, detail: 'Pug loop: each item in items', insertText: 'each ${1:item} in ${2:items}\\n  '},
-        { label: 'while', kind: CompletionItemKind.Snippet, detail: 'Pug loop: while condition', insertText: 'while ${1:condition}\\n  '},
-        // TODO: Add attributes, mixins, etc. based on context
+        { label: 'if', kind: CompletionItemKind.Snippet, detail: 'Pug conditional: if condition' , insertText: 'if ${1:condition}\n  '},
+        { label: 'else if', kind: CompletionItemKind.Snippet, detail: 'Pug conditional: else if condition', insertText: 'else if ${1:condition}\n  '},
+        { label: 'else', kind: CompletionItemKind.Snippet, detail: 'Pug conditional: else', insertText: 'else\n  '},
+        { label: 'each', kind: CompletionItemKind.Snippet, detail: 'Pug loop: each item in items', insertText: 'each ${1:item} in ${2:items}\n  '},
+        { label: 'while', kind: CompletionItemKind.Snippet, detail: 'Pug loop: while condition', insertText: 'while ${1:condition}\n  '},
       ];
-      return CompletionList.create(commonPugTags, false); // `isIncomplete` is false for now
+      items.push(...commonPugTags);
     }
+
+    // If items have been added, return them, otherwise null.
+    return items.length > 0 ? CompletionList.create(items, false) : null;
+  }
+
+  // Helper to find AST node at a given offset
+  // This is a very basic version. A more robust one would handle nested structures better.
+  function findPugNodeAtOffset(ast: pugParser.Node | undefined, offset: number): pugParser.Node | null {
+    if (!ast) return null;
+
+    let foundNode: pugParser.Node | null = null;
+
+    function walk(node: pugParser.Node) {
+      // Check if node.line and node.column exist and are numbers
+      // The pug-parser AST nodes don't have direct offset or end line/column.
+      // This makes precise node finding by offset difficult without pre-calculating ranges for all nodes.
+      // For now, this function is a placeholder for a more complex AST traversal.
+      // A simple strategy: if a Tag node's line matches, and its name is at/before the column.
+      // This won't work well for finding attributes or content.
+
+      // Placeholder for a more advanced AST lookup.
+      // For a Tag node, its `line` and `column` refer to the start of the tag name.
+      if (node.type === 'Tag' && typeof node.line === 'number' && typeof node.column === 'number') {
+         // This is a very rough check
+         // We need to convert positionInPurePug to an offset to compare with a conceptual node offset
+      }
+
+      if (node.type === 'Block' && node.nodes) {
+        for (const child of node.nodes) {
+          walk(child);
+          if (foundNode) return; // Stop if found
+        }
+      }
+      // For Tag nodes, also check attrs and block
+      if (node.type === 'Tag') {
+        if (node.attrs) {
+            // node.attrs is an array of {name, val, line, column, mustEscape}
+            // Need to check these too
+        }
+        if (node.block) {
+          walk(node.block);
+          if (foundNode) return;
+        }
+      }
+    }
+    // walk(ast); // Disabled for now as it's not effective yet
+    return foundNode;
+  }
+
+
+  function doHover(parsedResult: ParsedPug, positionInPurePug: Position): Hover | null {
+    const { purePugContent, pugAst, interpolations } = parsedResult;
+
+    const wordInfo = getWordAtPosition(purePugContent, positionInPurePug);
+    if (!wordInfo) return null;
+
+    const { text: word, range: wordRange } = wordInfo;
+
+    // Check if hovering over an interpolation placeholder first
+    for (const interp of interpolations) {
+      // Compare wordRange with interp.placeholderRangeInPurePug
+      // placeholderRangeInPurePug is a Range object.
+      if (interp.placeholderRangeInPurePug &&
+          interp.placeholderRangeInPurePug.start.line === wordRange.start.line &&
+          interp.placeholderRangeInPurePug.start.character === wordRange.start.character &&
+          interp.placeholderRangeInPurePug.end.character === wordRange.end.character // Simple check if it's the placeholder
+         ) {
+         return {
+          contents: {
+            kind: MarkupKind.Markdown,
+            value: `**JavaScript Interpolation:**\n\`\`\`javascript\n${interp.originalExpression}\n\`\`\``
+          },
+          range: wordRange
+        };
+      }
+    }
+
+    // TODO: Implement a more robust way to find the AST node at positionInPurePug.
+    // const astNodeAtPosition = findPugNodeAtOffset(pugAst, positionToOffset(purePugContent, positionInPurePug));
+    // if (astNodeAtPosition) {
+    //   if (astNodeAtPosition.type === 'Tag') {
+    //     return { contents: `Pug Tag: \`${(astNodeAtPosition as pugParser.Tag).name}\``, range: wordRange };
+    //   }
+    //   // Add more checks for attributes, text, etc.
+    // }
+
+    // Fallback to simple word checks if AST inspection is not yet fully implemented
+    const commonTags = ['div', 'p', 'span', 'a', 'img', 'ul', 'li', 'h1', 'h2', 'h3', 'button', 'input', 'textarea', 'label', 'form'];
+    if (commonTags.includes(word)) {
+      return {
+        contents: { kind: MarkupKind.Markdown, value: `**Pug Tag:** \`${word}\`\n\nStandard HTML element.` },
+        range: wordRange
+      };
+    }
+
+    const directives = ['if', 'else if', 'else', 'each', 'while', 'case', 'when', 'default', 'mixin', 'block', 'extends', 'include'];
+    if (directives.includes(word)) {
+       return {
+        contents: { kind: MarkupKind.Markdown, value: `**Pug Directive:** \`${word}\`` },
+        range: wordRange
+      };
+    }
+
     return null;
   }
 
@@ -312,84 +484,6 @@ function createReactPugLanguageService(settings: ReactPugSettings): IReactPugLan
     doComplete,
     doHover,
   };
-}
-
-
-function getWordAtPosition(text: string, position: Position): { text: string, range: Range } | null {
-  const lineText = text.split('\n')[position.line];
-  if (!lineText) return null;
-
-  // Regex to find a "word" (alphanumeric + dashes for Pug tags/attributes)
-  const wordRegex = /[\w-]+/g;
-  let match;
-  while ((match = wordRegex.exec(lineText)) !== null) {
-    const wordStart = match.index;
-    const wordEnd = match.index + match[0].length;
-    if (position.character >= wordStart && position.character <= wordEnd) {
-      return {
-        text: match[0],
-        range: Range.create(position.line, wordStart, position.line, wordEnd)
-      };
-    }
-  }
-  return null;
-}
-
-// Basic Hover implementation
-function doHover(parsedResult: ParsedPug, positionInPurePug: Position): Hover | null {
-  const { purePugContent, pugAst } = parsedResult;
-
-  const wordInfo = getWordAtPosition(purePugContent, positionInPurePug);
-  if (!wordInfo) return null;
-
-  const { text: word, range: wordRange } = wordInfo;
-
-  // Simple check for common Pug tags
-  const commonTags = ['div', 'p', 'span', 'a', 'img', 'ul', 'li', 'h1', 'h2', 'h3', 'button', 'input', 'textarea', 'label', 'form'];
-  if (commonTags.includes(word)) {
-    return {
-      contents: {
-        kind: MarkupKind.Markdown,
-        value: `**Pug Tag:** \`${word}\`\n\nStandard HTML element.`
-      },
-      range: wordRange // Range is relative to purePugContent
-    };
-  }
-
-  // Simple check for Pug directives
-  const directives = ['if', 'else if', 'else', 'each', 'while', 'case', 'when', 'default', 'mixin', 'block', 'extends', 'include'];
-  if (directives.includes(word)) {
-     return {
-      contents: {
-        kind: MarkupKind.Markdown,
-        value: `**Pug Directive:** \`${word}\``
-      },
-      range: wordRange
-    };
-  }
-
-  // TODO: More advanced hover by inspecting pugAst at the given position.
-  // For example, show attribute info, variable types (if type info is available), mixin details.
-
-  // Check if hovering over an interpolation placeholder
-  for (const interp of parsedResult.interpolations) {
-    // This check needs placeholderRangeInPurePug to be accurate Line/Char Range
-    // For now, let's assume it's a simple text match if the placeholder is the word.
-    if (word === interp.placeholder) {
-       return {
-        contents: {
-          kind: MarkupKind.Markdown,
-          value: `**JavaScript Interpolation:**\n\`\`\`javascript\n${interp.originalExpression}\n\`\`\``
-        },
-        // The range should ideally be interp.placeholderRangeInPurePug
-        // If wordRange matches this, it's good.
-        range: wordRange
-      };
-    }
-  }
-
-
-  return null;
 }
 
 // Export the factory
