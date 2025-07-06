@@ -210,4 +210,92 @@ describe('onHover Handler', () => {
     const result = await onHoverHandler({ textDocument: { uri: doc.uri }, position: Position.create(0, 5) });
     expect(result).toBeNull();
   });
+
+  it('should provide hover information for local scope variables', async () => {
+    const localConst = "const myLocalString = 'Local Value';";
+    const pugContent = "p #{myLocalStr}"; // Hovering over myLocalStr
+    const docContent = `
+      function TestHoverComponent() {
+        ${localConst}
+        return pug\`${pugContent}\`;
+      }
+    `;
+    const doc = createDoc('file:///test-local-hover.tsx', docContent);
+    const literalContentRange = Range.create(3, 20, 3, 20 + pugContent.length); // Approximate
+
+    const programAst = acorn.parse(docContent, { ecmaVersion: 'latest', sourceType: 'module', locations:true });
+    const functionScopeNode = (programAst as any).body.find(n => n.type === 'FunctionDeclaration');
+
+    serverModule.documents = { get: jest.fn().mockReturnValue(doc) };
+    serverModule.findPugLiterals.mockReturnValue([{
+      content: pugContent,
+      contentRange: literalContentRange,
+      indentation: "  ",
+      enclosingScopeNode: functionScopeNode,
+    }]);
+    serverModule.extractImportStatements.mockReturnValue([]);
+    jest.spyOn(serverModule, 'extractDeclarationsFromScope').mockReturnValue([localConst]);
+
+    const generatedJsx = "<p>{myLocalStr}</p>"; // Simplified
+    (compilePugToJsxString as jest.Mock).mockReturnValue({ jsx: generatedJsx, sourceMap: { version: 3, sources:[], mappings:'' } });
+
+    const mockMapData = { consumer: {}, originalPugContent: pugContent, generatedJsxContent: generatedJsx };
+    (parseSourceMap as jest.Mock).mockResolvedValue(mockMapData);
+
+    // Cursor in Pug: p #{myLocalStr|}
+    const cursorPugPosition = Position.create(0, pugContent.indexOf('myLocalStr') + 'myLocalStr'.length);
+    // Corresponding position in JSX: <p>{myLocalStr|}</p>
+    const mappedJsxPosition = Position.create(0, generatedJsx.indexOf('myLocalStr') + 'myLocalStr'.length);
+    (mapPugPositionToJsxPosition as jest.Mock).mockReturnValue(mappedJsxPosition);
+
+    const virtualTsxContent = `${localConst}\nimport React from 'react';\nconst C = () => (<>${generatedJsx}</>);`;
+    const jsxOffset = 100; // Dummy offset
+    (positionToOffset as jest.Mock).mockReturnValue(jsxOffset);
+
+    const mockQuickInfoResult: ts.QuickInfo = {
+      kind: ts.ScriptElementKind.variableElement,
+      kindModifiers: ts.ScriptElementKindModifier.constModifier,
+      textSpan: { start: jsxOffset - 'myLocalStr'.length, length: 'myLocalStr'.length }, // Span of 'myLocalStr' in JSX
+      displayParts: [{ text: '(const) myLocalString: "Local Value"', kind: 'text' }],
+      documentation: [{text: 'A local string variable.', kind: 'text'}]
+    };
+    mockTsLangService.getQuickInfoAtPosition.mockReturnValue(mockQuickInfoResult);
+
+    const mockJsxSourceFile = { text: virtualTsxContent, statements: [], fileName: `${doc.uri}/literal-0.pug.virtual.tsx` };
+    mockTsLangService.getProgram().getSourceFile.mockReturnValue(mockJsxSourceFile);
+
+    mockTs.getLineAndCharacterOfPosition.mockImplementation((sf, offset) => {
+      // Simplified for the 'myLocalStr' part in JSX
+      if (offset === jsxOffset - 'myLocalStr'.length) return { line: 0, character: mappedJsxPosition.character - 'myLocalStr'.length };
+      if (offset === jsxOffset) return { line: 0, character: mappedJsxPosition.character };
+      return { line:0, character:0};
+    });
+
+    // mapJsxRangeToPugRange should map the JSX span of 'myLocalStr' to Pug span of 'myLocalStr'
+    const pugHoverRange = Range.create(
+        cursorPugPosition.line,
+        cursorPugPosition.character - 'myLocalStr'.length,
+        cursorPugPosition.line,
+        cursorPugPosition.character
+    );
+    (mapJsxRangeToPugRange as jest.Mock).mockReturnValue(pugHoverRange);
+
+    // Actual cursor position in document for the request
+    const requestPosition = Position.create(3, 20 + cursorPugPosition.character);
+    const result = await onHoverHandler({ textDocument: { uri: doc.uri }, position: requestPosition });
+
+    expect(result).not.toBeNull();
+    expect(result.contents).toEqual({
+      kind: 'markdown',
+      value: '(const) myLocalString: "Local Value"\n\n---\nA local string variable.'
+    });
+    const expectedDocRelativeRange = Range.create(
+        literalContentRange.start.line + pugHoverRange.start.line,
+        (pugHoverRange.start.line === 0 ? literalContentRange.start.character : 0) + pugHoverRange.start.character,
+        literalContentRange.start.line + pugHoverRange.end.line,
+        (pugHoverRange.end.line === 0 ? literalContentRange.start.character : 0) + pugHoverRange.end.character
+    );
+    expect(result.range).toEqual(expectedDocRelativeRange);
+    expect(serverModule.extractDeclarationsFromScope).toHaveBeenCalledWith(functionScopeNode, docContent);
+  });
 });

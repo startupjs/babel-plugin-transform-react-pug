@@ -20,14 +20,14 @@ import { DiagnosticSeverity } from 'vscode-languageserver-types';
 
 import { TextDocument } from 'vscode-languageserver-textdocument';
 import * as acorn from 'acorn';
+import * as walk from 'acorn-walk'; // Import acorn-walk
 import * as ts from 'typescript';
 import { pathToFileURL } from 'url';
 
-import { IReactPugLanguageService, createReactPugLanguageService } from './reactPugLanguageService'; // Removed PreprocessedPug as it's unused
-import { positionToOffset } from './utils/textPositions'; // offsetToPosition might be needed later if not already used
+import { IReactPugLanguageService, createReactPugLanguageService } from './reactPugLanguageService';
+import { positionToOffset } from './utils/textPositions';
 import { compilePugToJsxString, PugToJsxResult } from './pugToJsxTransformer';
 import { parseSourceMap, mapJsxRangeToPugRange, mapPugPositionToJsxPosition, destroySourceMapData } from './jsxPugMapping';
-
 
 const connection = createConnection(ProposedFeatures.all);
 const documents: TextDocuments<TextDocument> = new TextDocuments(TextDocument);
@@ -66,6 +66,7 @@ export interface PugLiteralInfo {
   range: Range;
   contentRange: Range;
   indentation: string;
+  enclosingScopeNode?: acorn.Node; // AST node of the enclosing function/block
 }
 
 interface ReactPugSettings {
@@ -76,7 +77,9 @@ interface ReactPugSettings {
 const defaultSettings: ReactPugSettings = { maxNumberOfProblems: 100, classAttribute: 'className' };
 let globalSettings: ReactPugSettings = defaultSettings;
 const documentSettings: Map<string, Thenable<ReactPugSettings>> = new Map();
-let oldPugLanguageService: IReactPugLanguageService; // Renamed to avoid confusion
+let oldPugLanguageService: IReactPugLanguageService;
+
+let hasConfigurationCapability = false;
 
 connection.onInitialize((params: InitializeParams) => {
   const capabilities = params.capabilities;
@@ -86,7 +89,7 @@ connection.onInitialize((params: InitializeParams) => {
   if (params.initializationOptions?.classAttribute) {
     initialSettings.classAttribute = params.initializationOptions.classAttribute;
   }
-  oldPugLanguageService = createReactPugLanguageService(initialSettings); // Initialize old service
+  oldPugLanguageService = createReactPugLanguageService(initialSettings);
   globalSettings = initialSettings;
 
   connection.console.log('React Pug Language Server initialized.');
@@ -95,7 +98,7 @@ connection.onInitialize((params: InitializeParams) => {
       textDocumentSync: TextDocumentSyncKind.Incremental,
       completionProvider: { resolveProvider: false },
       hoverProvider: true,
-      definitionProvider: true, // Added definition provider capability
+      definitionProvider: true,
     }
   };
   return result;
@@ -107,8 +110,6 @@ connection.onInitialized(() => {
   }
 });
 
-let hasConfigurationCapability = false;
-
 connection.onDidChangeConfiguration(async (change) => {
   if (hasConfigurationCapability) {
     documentSettings.clear();
@@ -116,7 +117,7 @@ connection.onDidChangeConfiguration(async (change) => {
     globalSettings = (change.settings.reactPug || defaultSettings) as ReactPugSettings;
   }
   const newSettings = await getDocumentSettings('');
-  oldPugLanguageService = createReactPugLanguageService(newSettings); // Update old service with new settings
+  oldPugLanguageService = createReactPugLanguageService(newSettings);
   connection.console.log(`Configuration changed. Active classAttribute: ${newSettings.classAttribute}`);
   documents.all().forEach(validateTextDocument);
 });
@@ -138,7 +139,6 @@ function getDocumentSettings(resource: string): Thenable<ReactPugSettings> {
 
 documents.onDidClose(e => {
   documentSettings.delete(e.document.uri);
-  // Consider cleaning virtualFiles associated with e.document.uri
 });
 
 documents.onDidChangeContent(change => {
@@ -146,7 +146,6 @@ documents.onDidChangeContent(change => {
 });
 
 function findPugLiterals(textDocument: TextDocument): PugLiteralInfo[] {
-  // ... (implementation as previously defined, confirmed correct) ...
   const results: PugLiteralInfo[] = [];
   const text = textDocument.getText();
   try {
@@ -159,59 +158,69 @@ function findPugLiterals(textDocument: TextDocument): PugLiteralInfo[] {
       allowAwaitOutsideFunction: true,
       allowSuperOutsideMethod: true,
       allowHashBang: true,
-    });
+    }) as acorn.Node;
 
-    function walk(node: any, callback: (node: any) => void) {
-      callback(node);
-      for (const key in node) {
-        if (node[key] && typeof node[key] === 'object') {
-          if (Array.isArray(node[key])) {
-            node[key].forEach((child: any) => walk(child, callback));
-          } else if (node[key].type) {
-            walk(node[key], callback);
-          }
-        }
-      }
-    }
+    walk.ancestor(ast, {
+      TaggedTemplateExpression: (node, ancestors: acorn.Node[]) => {
+        const ttNode = node as any;
+        if (ttNode.tag.type === 'Identifier' && ttNode.tag.name === 'pug') {
+          if (ttNode.quasi && ttNode.quasi.quasis && ttNode.quasi.quasis.length > 0) {
+            const nodeStartPosition = Position.create(ttNode.loc.start.line - 1, ttNode.loc.start.column);
+            const nodeEndPosition = Position.create(ttNode.loc.end.line - 1, ttNode.loc.end.column);
+            const nodeRange = Range.create(nodeStartPosition, nodeEndPosition);
 
-    walk(ast, (node: any) => {
-      if (node.type === 'TaggedTemplateExpression' && node.tag.type === 'Identifier' && node.tag.name === 'pug') {
-        if (node.quasi && node.quasi.quasis && node.quasi.quasis.length > 0) {
-          const nodeStartPosition = Position.create(node.loc.start.line - 1, node.loc.start.column);
-          const nodeEndPosition = Position.create(node.loc.end.line - 1, node.loc.end.column);
-          const nodeRange = Range.create(nodeStartPosition, nodeEndPosition);
+            const contentStartPosition = Position.create(ttNode.quasi.loc.start.line - 1, ttNode.quasi.loc.start.column + 1);
+            const contentEndPosition = Position.create(ttNode.quasi.loc.end.line - 1, ttNode.quasi.loc.end.column - 1);
+            const contentRange = Range.create(contentStartPosition, contentEndPosition);
 
-          const contentStartPosition = Position.create(node.quasi.loc.start.line - 1, node.quasi.loc.start.column + 1);
-          const contentEndPosition = Position.create(node.quasi.loc.end.line - 1, node.quasi.loc.end.column - 1);
-          const contentRange = Range.create(contentStartPosition, contentEndPosition);
+            let extractedContent = "";
+            for (let i = 0; i < ttNode.quasi.quasis.length; i++) {
+              const quasi = ttNode.quasi.quasis[i];
+              const quasiStartPos = Position.create(quasi.loc.start.line - 1, quasi.loc.start.column);
+              const quasiEndPos = Position.create(quasi.loc.end.line - 1, quasi.loc.end.column);
+              extractedContent += textDocument.getText(Range.create(quasiStartPos, quasiEndPos));
 
-          let extractedContent = "";
-          for (let i = 0; i < node.quasi.quasis.length; i++) {
-            const quasi = node.quasi.quasis[i];
-            const quasiStartPos = Position.create(quasi.loc.start.line - 1, quasi.loc.start.column);
-            const quasiEndPos = Position.create(quasi.loc.end.line - 1, quasi.loc.end.column);
-            extractedContent += textDocument.getText(Range.create(quasiStartPos, quasiEndPos));
-
-            if (i < node.quasi.expressions.length) {
-              const expr = node.quasi.expressions[i];
-              const exprStartPos = Position.create(expr.loc.start.line - 1, expr.loc.start.column);
-              const exprEndPos = Position.create(expr.loc.end.line - 1, expr.loc.end.column);
-              extractedContent += `\${${textDocument.getText(Range.create(exprStartPos, exprEndPos))}}`;
+              if (i < ttNode.quasi.expressions.length) {
+                const expr = ttNode.quasi.expressions[i];
+                const exprStartPos = Position.create(expr.loc.start.line - 1, expr.loc.start.column);
+                const exprEndPos = Position.create(expr.loc.end.line - 1, expr.loc.end.column);
+                extractedContent += `\${${textDocument.getText(Range.create(exprStartPos, exprEndPos))}}`;
+              }
             }
-          }
 
-          let indentation = "";
-          const lineOfOpeningBacktick = contentStartPosition.line;
-          const textBeforeBacktick = textDocument.getText(Range.create(
-            Position.create(lineOfOpeningBacktick, 0),
-            Position.create(lineOfOpeningBacktick, contentStartPosition.character -1)
-          ));
-          const match = textBeforeBacktick.match(/^(\s*)/);
-          if (match) {
-            indentation = match[1];
-          }
+            let indentation = "";
+            const lineOfOpeningBacktick = contentStartPosition.line;
+            const textBeforeBacktick = textDocument.getText(Range.create(
+              Position.create(lineOfOpeningBacktick, 0),
+              Position.create(lineOfOpeningBacktick, contentStartPosition.character -1)
+            ));
+            const match = textBeforeBacktick.match(/^(\s*)/);
+            if (match) {
+              indentation = match[1];
+            }
 
-          results.push({ content: extractedContent, range: nodeRange, contentRange: contentRange, indentation: indentation });
+            let enclosingScopeNode: acorn.Node | undefined = undefined;
+            for (let i = ancestors.length - 2; i >= 0; i--) {
+              const ancestorNode = ancestors[i];
+              if (
+                ancestorNode.type === 'FunctionDeclaration' ||
+                ancestorNode.type === 'FunctionExpression' ||
+                ancestorNode.type === 'ArrowFunctionExpression' ||
+                ancestorNode.type === 'BlockStatement' ||
+                ancestorNode.type === 'Program'
+              ) {
+                enclosingScopeNode = ancestorNode;
+                break;
+              }
+            }
+            results.push({
+              content: extractedContent,
+              range: nodeRange,
+              contentRange: contentRange,
+              indentation: indentation,
+              enclosingScopeNode: enclosingScopeNode
+            });
+          }
         }
       }
     });
@@ -221,8 +230,31 @@ function findPugLiterals(textDocument: TextDocument): PugLiteralInfo[] {
   return results;
 }
 
+function extractDeclarationsFromScope(scopeNode: acorn.Node | undefined, documentText: string): string[] {
+  if (!scopeNode) return [];
+  const declarations: string[] = [];
+  let nodesToWalk: acorn.Node[] = [];
+
+  if (scopeNode.type === 'FunctionDeclaration' || scopeNode.type === 'FunctionExpression' || scopeNode.type === 'ArrowFunctionExpression') {
+    const funcNode = scopeNode as any;
+    if (funcNode.body && funcNode.body.type === 'BlockStatement' && Array.isArray(funcNode.body.body)) {
+      nodesToWalk = funcNode.body.body;
+    }
+  } else if ((scopeNode.type === 'BlockStatement' || scopeNode.type === 'Program') && Array.isArray((scopeNode as any).body)) {
+    nodesToWalk = (scopeNode as any).body;
+  }
+
+  for (const node of nodesToWalk) {
+    if (node.type === 'VariableDeclaration' || node.type === 'FunctionDeclaration') {
+      if (typeof (node as any).start === 'number' && typeof (node as any).end === 'number') {
+        declarations.push(documentText.substring((node as any).start, (node as any).end));
+      }
+    }
+  }
+  return declarations;
+}
+
 function extractImportStatements(document: TextDocument): string[] {
-  // ... (implementation as previously defined, confirmed correct) ...
   const importStatements: string[] = [];
   try {
     const ast = acorn.parse(document.getText(), {
@@ -255,17 +287,16 @@ async function validateTextDocument(textDocument: TextDocument): Promise<void> {
   const diagnostics: Diagnostic[] = [];
   const pugLiterals = findPugLiterals(textDocument);
   const importStatements = extractImportStatements(textDocument);
+  const documentText = textDocument.getText();
   let literalIndex = 0;
 
   for (const literal of pugLiterals) {
-    const rawPugInLiteral = literal.content; // Corrected: Use extracted content
-    const currentLiteralIndex = literalIndex++; // Corrected: Use consistent indexing
+    const rawPugInLiteral = literal.content;
+    const currentLiteralIndex = literalIndex++;
+    const localDeclarations = extractDeclarationsFromScope(literal.enclosingScopeNode, documentText);
 
     const babelInputFilename = `${textDocument.uri}/literal-${currentLiteralIndex}.pug.virtual.js`;
     const virtualTsxFilename = `${textDocument.uri}/literal-${currentLiteralIndex}.pug.virtual.tsx`;
-
-    // connection.console.log(`Processing Pug literal at L${literal.contentRange.start.line} C${literal.contentRange.start.character}`);
-    // connection.console.log(`Original Pug:\n${rawPugInLiteral}`);
 
     const compileResult: PugToJsxResult = compilePugToJsxString(rawPugInLiteral, { classAttribute: settings.classAttribute }, babelInputFilename);
 
@@ -281,6 +312,7 @@ async function validateTextDocument(textDocument: TextDocument): Promise<void> {
 
     const virtualTsxContent = `
 ${importStatements.join('\n')}
+${localDeclarations.join('\n')}
 import React from 'react';
 const PugComponent = () => (<>${compileResult.jsx}</>);
 export default PugComponent;
@@ -306,7 +338,6 @@ export default PugComponent;
           code: tsDiag.code
         });
       });
-      // if (compileResult.sourceMap) destroySourceMapData(mapData); // mapData is null here
       continue;
     }
 
@@ -364,10 +395,6 @@ export default PugComponent;
   connection.sendDiagnostics({ uri: textDocument.uri, diagnostics });
 }
 
-// onCompletion, onHover, onDefinition handlers as previously defined and confirmed correct...
-// ... (The full code for onCompletion, mapTsCompletionKindToLspKind, displayPartsToString, onHover, onDefinition)
-// The following is the exact code for these handlers from my verified internal state:
-
 connection.onCompletion(
   async (textDocumentPosition: TextDocumentPositionParams): Promise<CompletionItem[] | null> => {
     const document = documents.get(textDocumentPosition.textDocument.uri);
@@ -376,6 +403,7 @@ connection.onCompletion(
     const settings = await getDocumentSettings(document.uri);
     const pugLiterals = findPugLiterals(document);
     const importStatements = extractImportStatements(document);
+    const documentText = document.getText();
     let literalIndex = 0;
 
     for (const literal of pugLiterals) {
@@ -386,6 +414,7 @@ connection.onCompletion(
 
       if (docOffset >= literalContentStartOffset && docOffset <= literalContentEndOffset) {
         const rawPugInLiteral = literal.content;
+        const localDeclarations = extractDeclarationsFromScope(literal.enclosingScopeNode, documentText);
         const cursorPugPosition = Position.create(
           textDocumentPosition.position.line - literal.contentRange.start.line,
           textDocumentPosition.position.character - (textDocumentPosition.position.line === literal.contentRange.start.line ? literal.contentRange.start.character : 0)
@@ -395,7 +424,6 @@ connection.onCompletion(
         const virtualTsxFilename = `${document.uri}/literal-${currentLiteralIndex}.pug.virtual.tsx`;
 
         const compileResult = compilePugToJsxString(rawPugInLiteral, { classAttribute: settings.classAttribute }, babelInputFilename);
-
         if (compileResult.error || !compileResult.jsx || !compileResult.sourceMap) {
           continue;
         }
@@ -406,11 +434,6 @@ connection.onCompletion(
         }
 
         const jsxPosition = mapPugPositionToJsxPosition(cursorPugPosition, mapData);
-
-        // If jsxPosition is null, mapData is not needed further for this path.
-        // However, if jsxPosition is valid, mapData will be needed for TextEdits.
-        // So, defer destroying mapData until after processing completions or if jsxPosition is null.
-
         if (!jsxPosition) {
           destroySourceMapData(mapData);
           continue;
@@ -418,6 +441,7 @@ connection.onCompletion(
 
         const virtualTsxContent = `
 ${importStatements.join('\n')}
+${localDeclarations.join('\n')}
 import React from 'react';
 const PugComponent = () => (<>${compileResult.jsx}</>);
 export default PugComponent;
@@ -426,11 +450,8 @@ export default PugComponent;
         const jsxOffset = positionToOffset(virtualTsxContent, jsxPosition);
 
         const tsCompletions = tsLangService.getCompletionsAtPosition(virtualTsxFilename, jsxOffset, undefined);
-
-        // Note: mapData is NOT destroyed here yet. It's needed for TextEdits below.
-
         if (!tsCompletions || !tsCompletions.entries) {
-          destroySourceMapData(mapData); // Destroy if no completions to process
+          destroySourceMapData(mapData);
           return null;
         }
 
@@ -439,15 +460,8 @@ export default PugComponent;
 
         for (const entry of tsCompletions.entries) {
           const details = tsLangService.getCompletionEntryDetails(
-            virtualTsxFilename,
-            jsxOffset,
-            entry.name,
-            undefined,
-            entry.source,
-            undefined,
-            entry.data
+            virtualTsxFilename, jsxOffset, entry.name, undefined, entry.source, undefined, entry.data
           );
-
           const lspItem: CompletionItem = {
             label: entry.name,
             kind: mapTsCompletionKindToLspKind(entry.kind),
@@ -461,14 +475,11 @@ export default PugComponent;
               const firstFileTextChange = firstAction.changes[0];
               if (firstFileTextChange.fileName === virtualTsxFilename && firstFileTextChange.textChanges.length > 0) {
                 const tsTextChange = firstFileTextChange.textChanges[0];
-
                 const jsxSourceFile = tsProgram?.getSourceFile(virtualTsxFilename);
                 if (jsxSourceFile) {
                   const startLoc = ts.getLineAndCharacterOfPosition(jsxSourceFile, tsTextChange.span.start);
                   const endLoc = ts.getLineAndCharacterOfPosition(jsxSourceFile, tsTextChange.span.start + tsTextChange.span.length);
                   const jsxRange = Range.create(startLoc.line, startLoc.character, endLoc.line, endLoc.character);
-
-                  // Use the original mapData obtained for this literal
                   const pugRange = mapJsxRangeToPugRange(jsxRange, mapData);
                   if (pugRange) {
                     const docRelativePugRange = Range.create(
@@ -485,8 +496,7 @@ export default PugComponent;
           }
           lspCompletionItems.push(lspItem);
         }
-
-        destroySourceMapData(mapData); // Destroy mapData after all entries and their details are processed
+        destroySourceMapData(mapData);
         return lspCompletionItems;
       }
     }
@@ -496,38 +506,17 @@ export default PugComponent;
 
 function mapTsCompletionKindToLspKind(tsKind: ts.ScriptElementKind): CompletionItemKind {
   switch (tsKind) {
-    case ts.ScriptElementKind.moduleElement:
-    case ts.ScriptElementKind.externalModuleName:
-      return CompletionItemKind.Module;
-    case ts.ScriptElementKind.classElement:
-      return CompletionItemKind.Class;
-    case ts.ScriptElementKind.interfaceElement:
-      return CompletionItemKind.Interface;
-    case ts.ScriptElementKind.memberFunctionElement:
-    case ts.ScriptElementKind.constructSignatureElement:
-    case ts.ScriptElementKind.callSignatureElement:
-    case ts.ScriptElementKind.indexSignatureElement:
-      return CompletionItemKind.Method;
-    case ts.ScriptElementKind.memberVariableElement:
-    case ts.ScriptElementKind.memberGetAccessorElement:
-    case ts.ScriptElementKind.memberSetAccessorElement:
-      return CompletionItemKind.Field;
-    case ts.ScriptElementKind.variableElement:
-    case ts.ScriptElementKind.letElement:
-    case ts.ScriptElementKind.constElement:
-    case ts.ScriptElementKind.parameterElement:
-      return CompletionItemKind.Variable;
-    case ts.ScriptElementKind.functionElement:
-    case ts.ScriptElementKind.localFunctionElement:
-      return CompletionItemKind.Function;
-    case ts.ScriptElementKind.keyword:
-      return CompletionItemKind.Keyword;
-    case ts.ScriptElementKind.primitiveType:
-      return CompletionItemKind.Unit;
-    case ts.ScriptElementKind.string:
-      return CompletionItemKind.Text;
-    default:
-      return CompletionItemKind.Text;
+    case ts.ScriptElementKind.moduleElement: case ts.ScriptElementKind.externalModuleName: return CompletionItemKind.Module;
+    case ts.ScriptElementKind.classElement: return CompletionItemKind.Class;
+    case ts.ScriptElementKind.interfaceElement: return CompletionItemKind.Interface;
+    case ts.ScriptElementKind.memberFunctionElement: case ts.ScriptElementKind.constructSignatureElement: case ts.ScriptElementKind.callSignatureElement: case ts.ScriptElementKind.indexSignatureElement: return CompletionItemKind.Method;
+    case ts.ScriptElementKind.memberVariableElement: case ts.ScriptElementKind.memberGetAccessorElement: case ts.ScriptElementKind.memberSetAccessorElement: return CompletionItemKind.Field;
+    case ts.ScriptElementKind.variableElement: case ts.ScriptElementKind.letElement: case ts.ScriptElementKind.constElement: case ts.ScriptElementKind.parameterElement: return CompletionItemKind.Variable;
+    case ts.ScriptElementKind.functionElement: case ts.ScriptElementKind.localFunctionElement: return CompletionItemKind.Function;
+    case ts.ScriptElementKind.keyword: return CompletionItemKind.Keyword;
+    case ts.ScriptElementKind.primitiveType: return CompletionItemKind.Unit;
+    case ts.ScriptElementKind.string: return CompletionItemKind.Text;
+    default: return CompletionItemKind.Text;
   }
 }
 
@@ -544,6 +533,7 @@ connection.onHover(
     const settings = await getDocumentSettings(document.uri);
     const pugLiterals = findPugLiterals(document);
     const importStatements = extractImportStatements(document);
+    const documentText = document.getText();
     let literalIndex = 0;
 
     for (const literal of pugLiterals) {
@@ -554,6 +544,7 @@ connection.onHover(
 
       if (docOffset >= literalContentStartOffset && docOffset <= literalContentEndOffset) {
         const rawPugInLiteral = literal.content;
+        const localDeclarations = extractDeclarationsFromScope(literal.enclosingScopeNode, documentText);
         const cursorPugPosition = Position.create(
           textDocumentPosition.position.line - literal.contentRange.start.line,
           textDocumentPosition.position.character - (textDocumentPosition.position.line === literal.contentRange.start.line ? literal.contentRange.start.character : 0)
@@ -563,7 +554,6 @@ connection.onHover(
         const virtualTsxFilename = `${document.uri}/literal-${currentLiteralIndex}.pug.virtual.tsx`;
 
         const compileResult = compilePugToJsxString(rawPugInLiteral, { classAttribute: settings.classAttribute }, babelInputFilename);
-
         if (compileResult.error || !compileResult.jsx || !compileResult.sourceMap) {
           continue;
         }
@@ -581,6 +571,7 @@ connection.onHover(
 
         const virtualTsxContent = `
 ${importStatements.join('\n')}
+${localDeclarations.join('\n')}
 import React from 'react';
 const PugComponent = () => (<>${compileResult.jsx}</>);
 export default PugComponent;
@@ -605,9 +596,9 @@ export default PugComponent;
           if (jsxSourceFile) {
             const startLoc = ts.getLineAndCharacterOfPosition(jsxSourceFile, quickInfo.textSpan.start);
             const endLoc = ts.getLineAndCharacterOfPosition(jsxSourceFile, quickInfo.textSpan.start + quickInfo.textSpan.length);
-            const jsxRange = Range.create(startLoc.line, startLoc.character, endLoc.line, endLoc.character);
+            const jsxRangeVal = Range.create(startLoc.line, startLoc.character, endLoc.line, endLoc.character); // Renamed to avoid conflict
 
-            const mappedPugRange = mapJsxRangeToPugRange(jsxRange, mapData);
+            const mappedPugRange = mapJsxRangeToPugRange(jsxRangeVal, mapData);
             if (mappedPugRange) {
               hoverRange = Range.create(
                 literal.contentRange.start.line + mappedPugRange.start.line,
@@ -638,6 +629,7 @@ connection.onDefinition(
     const settings = await getDocumentSettings(document.uri);
     const pugLiterals = findPugLiterals(document);
     const importStatements = extractImportStatements(document);
+    const documentText = document.getText();
     let literalIndex = 0;
 
     for (const literal of pugLiterals) {
@@ -648,6 +640,7 @@ connection.onDefinition(
 
       if (docOffset >= literalContentStartOffset && docOffset <= literalContentEndOffset) {
         const rawPugInLiteral = literal.content;
+        const localDeclarations = extractDeclarationsFromScope(literal.enclosingScopeNode, documentText);
         const cursorPugPosition = Position.create(
           textDocumentPosition.position.line - literal.contentRange.start.line,
           textDocumentPosition.position.character - (textDocumentPosition.position.line === literal.contentRange.start.line ? literal.contentRange.start.character : 0)
@@ -674,6 +667,7 @@ connection.onDefinition(
 
         const virtualTsxContent = `
 ${importStatements.join('\n')}
+${localDeclarations.join('\n')}
 import React from 'react';
 const PugComponent = () => (<>${compileResult.jsx}</>);
 export default PugComponent;

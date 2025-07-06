@@ -253,4 +253,78 @@ describe('onCompletion Handler', () => {
     expect(result).toBeNull();
   });
 
+  it('should provide completions for local scope variables', async () => {
+    const localFuncVar = "const myLocalValue = 123;";
+    const pugContent = "p #{myLo}"; // User typing myLo...
+    const docContent = `
+      function TestComponent() {
+        ${localFuncVar}
+        return pug\`${pugContent}\`;
+      }
+    `;
+    const doc = createDoc('file:///test-local-scope.tsx', docContent);
+    const literalContentRange = Range.create(3, 20, 3, 20 + pugContent.length); // Approximate
+
+    // Mock findPugLiterals to return the Pug literal *and* its enclosing scope node
+    const programAst = acorn.parse(docContent, { ecmaVersion: 'latest', sourceType: 'module', locations:true });
+    const functionScopeNode = (programAst as any).body.find(n => n.type === 'FunctionDeclaration'); // Get FunctionDeclaration node
+
+    serverModule.documents = { get: jest.fn().mockReturnValue(doc) };
+    serverModule.findPugLiterals.mockReturnValue([{
+      content: pugContent,
+      contentRange: literalContentRange,
+      indentation: "  ",
+      enclosingScopeNode: functionScopeNode, // Provide the scope node
+    }]);
+
+    // Mock extractImportStatements (likely empty for this self-contained example)
+    serverModule.extractImportStatements.mockReturnValue([]);
+    // Mock extractDeclarationsFromScope to return the local variable
+    // Note: In a real scenario, extractDeclarationsFromScope would parse functionScopeNode.
+    // Here, we are unit testing onCompletion's use of these, so we mock their direct output.
+    jest.spyOn(serverModule, 'extractDeclarationsFromScope').mockReturnValue([localFuncVar]);
+
+
+    const generatedJsx = "<p>{myLo}</p>"; // Simplified JSX for the typed portion
+    (compilePugToJsxString as jest.Mock).mockReturnValue({ jsx: generatedJsx, sourceMap: { version: 3, sources:[], mappings:'' } });
+
+    const mockMapData = { consumer: {}, originalPugContent: pugContent, generatedJsxContent: generatedJsx };
+    (parseSourceMap as jest.Mock).mockResolvedValue(mockMapData);
+
+    const cursorPugPosition = Position.create(0, pugContent.indexOf('myLo') + 'myLo'.length); // Cursor after "myLo" in "p #{myLo}"
+    const mappedJsxPosition = Position.create(0, generatedJsx.indexOf('myLo') + 'myLo'.length); // Corresponding position in "<p>{myLo}</p>"
+    (mapPugPositionToJsxPosition as jest.Mock).mockReturnValue(mappedJsxPosition);
+
+    const virtualTsxContentExpectedToContain = `${localFuncVar}\nimport React from 'react';`;
+    const jsxOffset = 100; // Dummy offset, real one calculated by positionToOffset
+    (positionToOffset as jest.Mock).mockReturnValue(jsxOffset);
+
+
+    mockTsLangService.getCompletionsAtPosition.mockImplementation((filename, offset, options) => {
+      // Check if the virtual file content (not directly available here) would contain localFuncVar
+      // For this test, we assume it does and TS service would find 'myLocalValue'
+      return {
+        entries: [{ name: 'myLocalValue', kind: ts.ScriptElementKind.variableElement }],
+      };
+    });
+    mockTsLangService.getCompletionEntryDetails.mockReturnValue({
+        name: 'myLocalValue', kind: ts.ScriptElementKind.variableElement, displayParts: [{text: 'myLocalValue', kind:'text'}]
+    });
+
+    // Position of `pug\`p #{myLo}\``, cursor at end of myLo
+    // Line numbers are 0-indexed in Position.create
+    const requestPosition = Position.create(3, 20 + pugContent.indexOf('myLo') + 'myLo'.length);
+    const result = await onCompletionHandler({ textDocument: { uri: doc.uri }, position: requestPosition });
+
+    expect(serverModule.extractDeclarationsFromScope).toHaveBeenCalledWith(functionScopeNode, docContent);
+    expect(result).not.toBeNull();
+    expect(result).toHaveLength(1);
+    expect(result[0].label).toBe('myLocalValue');
+    expect(result[0].kind).toBe(CompletionItemKind.Variable);
+
+    // Verify that updateVirtualFile was called with content including the local var
+    // This requires spying on updateVirtualFile or checking its effect on virtualFiles map
+    // which are internal to server.ts. For now, the functional outcome (completion provided) is the main check.
+  });
+
 });

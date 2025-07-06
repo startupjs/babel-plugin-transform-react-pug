@@ -274,6 +274,95 @@ describe('validateTextDocument - Diagnostics via JSX', () => {
   // 5. No Pug literals
   // 6. Multiple Pug literals
   // 7. TSX has no errors
+
+  it('should provide diagnostics for misuse of local scope variables in Pug', async () => {
+    const localVariableSetup = "const localNum = 10;";
+    // Using localNum as a function, which should be a type error
+    const pugContent = "p #{localNum()}";
+    const docContent = `
+      function MyErrorComponent() {
+        ${localVariableSetup}
+        return pug\`${pugContent}\`;
+      }
+    `;
+    const docUri = 'file:///test-local-diag.tsx';
+    const doc = createDoc(docUri, docContent);
+    const literalContentRange = Range.create(3, 20, 3, 20 + pugContent.length);
+
+    const programAst = acorn.parse(docContent, { ecmaVersion: 'latest', sourceType: 'module', locations:true });
+    const functionScopeNode = (programAst as any).body.find(n => n.type === 'FunctionDeclaration');
+
+    serverModule.documents = { get: jest.fn().mockReturnValue(doc) };
+    serverModule.findPugLiterals.mockReturnValue([{
+      content: pugContent,
+      contentRange: literalContentRange,
+      indentation: "  ",
+      enclosingScopeNode: functionScopeNode,
+    }]);
+    serverModule.extractImportStatements.mockReturnValue([]);
+    jest.spyOn(serverModule, 'extractDeclarationsFromScope').mockReturnValue([localVariableSetup]);
+
+    const generatedJsx = "<p>{localNum()}</p>";
+    const mockSourceMap = { version: 3, sources:['virtual.js'], mappings:'AAAA' };
+    (compilePugToJsxString as jest.Mock).mockReturnValue({ jsx: generatedJsx, sourceMap: mockSourceMap });
+
+    const mockMapData = { consumer: {}, originalPugContent: pugContent, generatedJsxContent: generatedJsx };
+    (parseSourceMap as jest.Mock).mockResolvedValue(mockMapData);
+
+    // Mock TS to return a semantic error for localNum()
+    const mockTsErrorDiagnostic: ts.Diagnostic = {
+      file: undefined, // Will be the virtual file
+      start: generatedJsx.indexOf("localNum()"),
+      length: "localNum()".length,
+      messageText: "This expression is not callable because type 'number' has no call signatures.",
+      category: ts.DiagnosticCategory.Error,
+      code: 2349, // Example TS error code
+    };
+    mockTsLangService.getSemanticDiagnostics.mockReturnValue([mockTsErrorDiagnostic]);
+    mockTsLangService.getSyntacticDiagnostics.mockReturnValue([]); // No syntactic errors in the JSX itself
+
+    const virtualTsxFilename = `${docUri}/literal-0.pug.virtual.tsx`;
+    const virtualTsxContent = `${localVariableSetup}\nimport React from 'react';\nconst C = () => (<>${generatedJsx}</>);`;
+    const mockJsxSourceFile = { text: virtualTsxContent, statements: [], fileName: virtualTsxFilename };
+    mockTsLangService.getProgram().getSourceFile.mockReturnValue(mockJsxSourceFile);
+
+    mockTs.getLineAndCharacterOfPosition.mockImplementation((sf, offset) => {
+      // For 'localNum()' in <p>{localNum()}</p>
+      const str = "localNum()";
+      const idx = generatedJsx.indexOf(str);
+      if (sf === mockJsxSourceFile && offset === idx) return { line: 0, character: idx + "{".length }; // Position of 'localNum()' inside {}
+      if (sf === mockJsxSourceFile && offset === idx + str.length) return { line: 0, character: idx + "{".length + str.length };
+      return { line: 0, character: 0 };
+    });
+
+    // mapJsxRangeToPugRange should map the JSX range of 'localNum()' back to Pug '#{localNum()}'
+    const pugErrorRange = Range.create(
+        0,
+        pugContent.indexOf('localNum()'),
+        0,
+        pugContent.indexOf('localNum()') + 'localNum()'.length
+    );
+    (mapJsxRangeToPugRange as jest.Mock).mockReturnValue(pugErrorRange);
+
+    await validateTextDocumentInternal(doc);
+
+    expect(mockConnection.sendDiagnostics).toHaveBeenCalledTimes(1);
+    const sentDiagnostics = mockConnection.sendDiagnostics.mock.calls[0][0].diagnostics;
+    expect(sentDiagnostics).toHaveLength(1);
+    const diag = sentDiagnostics[0] as Diagnostic;
+
+    const expectedDocRelativePugErrorRange = Range.create(
+      literalContentRange.start.line + pugErrorRange.start.line,
+      (pugErrorRange.start.line === 0 ? literalContentRange.start.character : 0) + pugErrorRange.start.character,
+      literalContentRange.start.line + pugErrorRange.end.line,
+      (pugErrorRange.end.line === 0 ? literalContentRange.start.character : 0) + pugErrorRange.end.character
+    );
+    expect(diag.range).toEqual(expectedDocRelativePugErrorRange);
+    expect(diag.message).toBe("This expression is not callable because type 'number' has no call signatures.");
+    expect(diag.severity).toBe(DiagnosticSeverity.Error);
+    expect(diag.source).toBe('React Pug (TS)');
+    expect(serverModule.extractDeclarationsFromScope).toHaveBeenCalledWith(functionScopeNode, docContent);
+  });
 });
 
 // Helper to make validateTextDocument accessible if not exported from server.ts

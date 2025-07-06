@@ -772,10 +772,22 @@ acorn-globals@^4.1.0:
   dependencies:
     acorn "^5.0.0"
 
+acorn-walk@^8.3.4:
+  version "8.3.4"
+  resolved "https://registry.yarnpkg.com/acorn-walk/-/acorn-walk-8.3.4.tgz#794dd169c3977edf4ba4ea47583587c5866236b7"
+  integrity sha512-ueEepnujpqee2o5aIYnvHU6C0A42MNdsIDeqy5BydrkuC5R1ZuUFnm27EeFJGoEHJQgn3uleRvmTXaJgfXbt4g==
+  dependencies:
+    acorn "^8.11.0"
+
 acorn@^5.0.0, acorn@^5.5.3:
   version "5.7.1"
   resolved "https://registry.yarnpkg.com/acorn/-/acorn-5.7.1.tgz#f095829297706a7c9776958c0afc8930a9b9d9d8"
   integrity sha512-d+nbxBUGKg7Arpsvbnlq61mc12ek3EY8EQldM3GPAhWJ1UVxC6TDGbIvUMNU6obBX3i1+ptCIzV4vq0gFPEGVQ==
+
+acorn@^8.11.0:
+  version "8.15.0"
+  resolved "https://registry.yarnpkg.com/acorn/-/acorn-8.15.0.tgz#a360898bc415edaac46c8241f6383975b930b816"
+  integrity sha512-NZyJarBfL7nWwIq+FDL6Zp/yHEhePMNnnJ0y3qfieCrmNvYct8uvtiV41UvlSe6apAfk0fY1FbWx+NwfmpvtTg==
 
 acorn@^8.8.2:
   version "8.11.3"
