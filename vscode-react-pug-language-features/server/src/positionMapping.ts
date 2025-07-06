@@ -40,53 +40,160 @@ export function mapDocumentPositionToPurePug(
   // This `originalRawPugContent` is `rawPugInLiteral` from server.ts AFTER baseIndentation stripping.
   // So, we first need to map `offsetInRawLiteralContent` to an offset in `preprocessingData.originalRawPugContent`.
 
-  // This is tricky. `PugLiteralInfo.indentation` is the base indent of the pug``` line.
-  // `preprocessingData.baseIndentationLength` is its length.
-  // `preprocessingData.contentIndentationLength` is the common indent *within* the block.
+  // 1. Check if documentPosition is within the pugLiteral.contentRange (already done by caller typically, but good for safety)
+  const docContent = document.getText(); // Get full document text once
+  const documentOffset = positionToOffset(docContent, documentPosition);
+  const literalContentStartOffsetDoc = positionToOffset(docContent, pugLiteral.contentRange.start);
+  const literalContentEndOffsetDoc = positionToOffset(docContent, pugLiteral.contentRange.end);
 
-  // Let's get the text that segments relate to:
-  // `textAfterContentIndentStripping` was used in `preprocessPug` to generate segments.
-  // This text is `pugLiteral.rawPugContent` (from server) after `baseIndentation` and `contentIndentation` were stripped.
-  // We need to map `offsetInRawLiteralContent` to an offset in this `textAfterContentIndentStripping`.
+  if (documentOffset < literalContentStartOffsetDoc || documentOffset > literalContentEndOffsetDoc) {
+    // console.warn("mapDocToPure: Doc position is outside pug literal content range.");
+    return null;
+  }
 
-  // This part is complex because indentation stripping is line-based.
-  // A robust way is to reconstruct the `textAfterContentIndentStripping` or iterate line by line.
+  // 2. Calculate position relative to the start of the raw Pug literal's content
+  // This rawPugContent is what was fed to preprocessPug
+  const positionInRawLiteralContent = Position.create(
+    documentPosition.line - pugLiteral.contentRange.start.line,
+    documentPosition.line === pugLiteral.contentRange.start.line
+      ? documentPosition.character - pugLiteral.contentRange.start.character
+      : documentPosition.character
+  );
 
-  // Simplified placeholder for this complex step:
-  // For now, assume offsetInRawLiteralContent can be roughly used with segments,
-  // knowing this is where precision will be lost without full line-by-line de-indentation mapping.
-  // TODO: Implement precise mapping from `offsetInRawLiteralContent` to an offset in the conceptual
-  // string that `preprocessingData.segments[].originalStartOffset` refers to.
+  // 3. Use lineMaps to find corresponding line in textAfterContentIndentStripping (TAS) and adjust character for stripped indentation
+  const lineMapEntry = preprocessingData.lineMaps[positionInRawLiteralContent.line];
+  if (!lineMapEntry) {
+    // console.warn(`mapDocToPure: No lineMap entry for raw literal line ${positionInRawLiteralContent.line}`);
+    return null; // Line out of bounds
+  }
 
-  let currentOffsetInTextAfterContentIndentStripping = offsetInRawLiteralContent; // Placeholder for more complex calculation
+  let charInTAS = positionInRawLiteralContent.character - lineMapEntry.originalLeadingWhitespaceLength;
 
-  // 4. Find the segment containing the position and map through it.
+  // If charInTAS is negative, it means the original document cursor was within the stripped leading whitespace.
+  // For Pug purposes, this effectively means it's at the beginning of the content on that line in TAS.
+  if (charInTAS < 0) {
+    charInTAS = 0;
+  }
+
+  // Ensure charInTAS does not exceed the length of the line in textAfterContentIndentStripping
+  const tasLines = preprocessingData.textAfterContentIndentStripping.split('\n');
+  const targetTASLineLength = tasLines[lineMapEntry.lineInTAS]?.length || 0;
+  charInTAS = Math.min(charInTAS, targetTASLineLength);
+
+  const positionInTAS = Position.create(lineMapEntry.lineInTAS, charInTAS);
+  const offsetInTAS = positionToOffset(preprocessingData.textAfterContentIndentStripping, positionInTAS);
+
+  // 4. Find the segment in textAfterContentIndentStripping containing the offsetInTAS and map through it.
   for (const segment of preprocessingData.segments) {
-    if (currentOffsetInTextAfterContentIndentStripping >= segment.originalStartOffset &&
-        currentOffsetInTextAfterContentIndentStripping <= segment.originalEndOffset) {
-
+    // Important: For cursor position, if it's at the end of a segment, it might belong to the next one for typing.
+    // However, if it's for querying what's *at* the position, originalEndOffset inclusive is okay.
+    // Let's use inclusive end for original, exclusive for pure when finding "before" a placeholder.
+    if (offsetInTAS >= segment.originalStartOffset && offsetInTAS <= segment.originalEndOffset) {
       if (segment.type === 'direct') {
-        const offsetWithinOriginalSegment = currentOffsetInTextAfterContentIndentStripping - segment.originalStartOffset;
+        const offsetWithinOriginalSegment = offsetInTAS - segment.originalStartOffset;
         const purePugOffset = segment.purePugStartOffset + offsetWithinOriginalSegment;
-        return offsetToPosition(preprocessingData.purePugContent, purePugOffset);
+        // Ensure purePugOffset is within bounds of purePugContent
+        const boundedPurePugOffset = Math.min(purePugOffset, preprocessingData.purePugContent.length);
+        return offsetToPosition(preprocessingData.purePugContent, boundedPurePugOffset);
       } else if (segment.type === 'interpolation' && segment.interpolation) {
-        // Position is within a JS interpolation.
-        // For now, we don't map into the content of the placeholder itself for Pug features.
-        // We might return the start or end of the placeholder, or null.
-        // Or, if the goal is to get features for the JS inside, that's a different mapping.
-        // Let's return null for now if inside an interpolation for Pug context.
+        // If the position is within an original interpolation block:
+        // Option 1: Return null (no Pug features inside JS) - Current choice
+        // Option 2: Map to the start/end of the placeholder.
+        //   - If offsetInTAS is closer to segment.originalStartOffset, map to placeholder start.
+        //   - If closer to segment.originalEndOffset, map to placeholder end.
+        // This allows completions *around* the placeholder.
+        if (offsetInTAS === segment.originalStartOffset) { // Cursor exactly at start of ${...}
+            return offsetToPosition(preprocessingData.purePugContent, segment.purePugStartOffset);
+        } else if (offsetInTAS === segment.originalEndOffset) { // Cursor exactly at end of ${...}
+            return offsetToPosition(preprocessingData.purePugContent, segment.purePugEndOffset);
+        }
+        // Otherwise, cursor is *inside* the JS expression. For Pug features, this is usually not a target.
         return null;
       }
     }
   }
 
-  // If it's exactly at the end of the last segment (e.g. typing at the end of the literal)
-  const lastSegment = preprocessingData.segments[preprocessingData.segments.length - 1];
-  if (lastSegment && currentOffsetInTextAfterContentIndentStripping === lastSegment.originalEndOffset) {
-      return offsetToPosition(preprocessingData.purePugContent, lastSegment.purePugEndOffset);
+  // Case: Position is exactly at the end of textAfterContentIndentStripping
+  if (offsetInTAS === preprocessingData.textAfterContentIndentStripping.length) {
+    const lastSegment = preprocessingData.segments[preprocessingData.segments.length -1];
+    if (lastSegment && lastSegment.originalEndOffset === offsetInTAS) { // Defensive check
+        return offsetToPosition(preprocessingData.purePugContent, lastSegment.purePugEndOffset);
+    }
+     // Or simply, end of purePugContent
+    return offsetToPosition(preprocessingData.purePugContent, preprocessingData.purePugContent.length);
   }
 
-  return null; // Should not be reached if logic is correct and position is within a segment
+  // console.warn(`mapDocToPure: Offset ${offsetInTAS} in TAS did not fall into any segment.`);
+  return null;
+}
+
+function mapPurePugPositionToDocumentPosition(
+  purePugPosition: Position,
+  pugLiteral: PugLiteralInfo,
+  preprocessingData: PugPreprocessingData,
+  document: TextDocument // Or just document.getText() if that's all that's needed
+): Position | null {
+  const purePugOffset = positionToOffset(preprocessingData.purePugContent, purePugPosition);
+  let offsetInTAS: number | null = null;
+
+  // 1. Map offsetInPurePug to offsetInTAS using segments
+  for (const segment of preprocessingData.segments) {
+    if (purePugOffset >= segment.purePugStartOffset && purePugOffset <= segment.purePugEndOffset) {
+      if (segment.type === 'direct') {
+        const offsetWithinPureSegment = purePugOffset - segment.purePugStartOffset;
+        offsetInTAS = segment.originalStartOffset + offsetWithinPureSegment;
+        // Ensure it doesn't exceed the original segment's length due to boundary conditions
+        offsetInTAS = Math.min(offsetInTAS, segment.originalEndOffset);
+        break;
+      } else if (segment.type === 'interpolation' && segment.interpolation) {
+        // If position is within a placeholder, map it to the start of the original interpolation expression.
+        // Or, could choose to map to originalStart/End based on proximity to placeholder start/end.
+        // For simplicity, mapping to originalStartOffset for any position within placeholder.
+        offsetInTAS = segment.originalStartOffset;
+        // If purePugOffset is exactly at segment.purePugEndOffset, map to originalEndOffset
+        if (purePugOffset === segment.purePugEndOffset) {
+            offsetInTAS = segment.originalEndOffset;
+        }
+        break;
+      }
+    }
+  }
+   // Case: Position is exactly at the end of purePugContent
+   if (offsetInTAS === null && purePugOffset === preprocessingData.purePugContent.length) {
+    const lastSegment = preprocessingData.segments[preprocessingData.segments.length -1];
+    if (lastSegment) { // Defensive check
+        offsetInTAS = lastSegment.originalEndOffset;
+    } else { // Empty purePugContent, map to start of original empty content
+        offsetInTAS = 0;
+    }
+  }
+
+  if (offsetInTAS === null) {
+    // console.warn(`mapPureToDoc: Could not map purePugOffset ${purePugOffset} to offsetInTAS.`);
+    return null;
+  }
+
+  // Ensure offsetInTAS is within bounds of textAfterContentIndentStripping
+  offsetInTAS = Math.min(offsetInTAS, preprocessingData.textAfterContentIndentStripping.length);
+
+  // 2. Convert offsetInTAS to positionInTAS
+  const positionInTAS = offsetToPosition(preprocessingData.textAfterContentIndentStripping, offsetInTAS);
+
+  // 3. Use lineMaps to find originalLineNumberInRawLiteral and re-add stripped whitespace
+  const lineMapEntry = preprocessingData.lineMaps[positionInTAS.line];
+  if (!lineMapEntry) {
+    // console.warn(`mapPureToDoc: No lineMap entry for TAS line ${positionInTAS.line}`);
+    return null;
+  }
+
+  const charInRawLiteralContent = positionInTAS.character + lineMapEntry.originalLeadingWhitespaceLength;
+  const originalLineInRawLiteral = lineMapEntry.originalLineNumberInRawLiteral; // This is already the correct line index in rawPugContent
+
+  // 4. Calculate final document position by adding pugLiteral.contentRange.start
+  const finalDocLine = pugLiteral.contentRange.start.line + originalLineInRawLiteral;
+  const finalDocChar = (originalLineInRawLiteral === 0 ? pugLiteral.contentRange.start.character : 0) + charInRawLiteralContent;
+
+  return Position.create(finalDocLine, finalDocChar);
 }
 
 
@@ -105,63 +212,21 @@ export function mapPurePugRangeToDocument(
   preprocessingData: PugPreprocessingData,
   document: TextDocument
 ): Range | null {
-  const purePugStartOffset = positionToOffset(preprocessingData.purePugContent, purePugRange.start);
-  const purePugEndOffset = positionToOffset(preprocessingData.purePugContent, purePugRange.end);
+  const docStartPosition = mapPurePugPositionToDocumentPosition(purePugRange.start, pugLiteral, preprocessingData, document);
+  const docEndPosition = mapPurePugPositionToDocumentPosition(purePugRange.end, pugLiteral, preprocessingData, document);
 
-  let docStartOffset: number | null = null;
-  let docEndOffset: number | null = null;
-
-  // Helper to map a single purePug offset to an offset in rawLiteralContent (before base indent re-addition)
-  function mapPureOffsetToOriginalPostIndentOffset(pureOffset: number): number | null {
-    for (const segment of preprocessingData.segments) {
-      if (pureOffset >= segment.purePugStartOffset && pureOffset <= segment.purePugEndOffset) {
-        if (segment.type === 'direct') {
-          const offsetWithinPureSegment = pureOffset - segment.purePugStartOffset;
-          return segment.originalStartOffset + offsetWithinPureSegment;
-        } else if (segment.type === 'interpolation') {
-          // If a range spans an interpolation, how should it be mapped?
-          // Option 1: Map to the original ${...} range.
-          // Option 2: Consider it unmappable or return a collapsed range.
-          // For diagnostics on placeholders, we might want to map to original ${...}
-          // For now, let's try to map to the start of the original interpolation
-          if (pureOffset === segment.purePugStartOffset) return segment.originalStartOffset;
-          if (pureOffset === segment.purePugEndOffset) return segment.originalEndOffset;
-          // If inside a placeholder, map to the original expression's full span
-          return segment.originalStartOffset; // Or originalEndOffset, or average... this is tricky
-        }
-      }
+  if (docStartPosition && docEndPosition) {
+    // Ensure start is not after end (can happen with complex mappings or zero-length ranges)
+    if (docStartPosition.line > docEndPosition.line ||
+        (docStartPosition.line === docEndPosition.line && docStartPosition.character > docEndPosition.character)) {
+      // console.warn("mapPurePugRangeToDocument: Mapped start position is after end position. Returning collapsed range at start.");
+      return Range.create(docStartPosition, docStartPosition); // Or swap them, or return null
     }
-     // If exactly at the end of the last segment
-    const lastSegment = preprocessingData.segments[preprocessingData.segments.length - 1];
-    if (lastSegment && pureOffset === lastSegment.purePugEndOffset) {
-        return lastSegment.originalEndOffset;
-    }
-    return null;
+    return Range.create(docStartPosition, docEndPosition);
   }
 
-  const originalStartOffsetPostIndent = mapPureOffsetToOriginalPostIndentOffset(purePugStartOffset);
-  const originalEndOffsetPostIndent = mapPureOffsetToOriginalPostIndentOffset(purePugEndOffset);
-
-  if (originalStartOffsetPostIndent === null || originalEndOffsetPostIndent === null) {
-    return null; // Part of the range couldn't be mapped
-  }
-
-  // TODO: Now, re-apply indentations (base and content) to these offsets to get document offsets.
-  // This is the reverse of the complex de-indentation logic.
-  // This step is also highly complex and requires careful line-by-line reconstruction or offset adjustment.
-  // Placeholder for this complex step:
-  const mappedDocStartOffset = positionToOffset(document.getText(), pugLiteral.contentRange.start) + originalStartOffsetPostIndent;
-  const mappedDocEndOffset = positionToOffset(document.getText(), pugLiteral.contentRange.start) + originalEndOffsetPostIndent;
-
-
-  if (mappedDocStartOffset > mappedDocEndOffset && purePugStartOffset <= purePugEndOffset) {
-      // This can happen if mapping of start/end via interpolations causes inversion
-      console.warn("mapPurePugRangeToDocument: mapped start offset is greater than end offset. Clamping.");
-      return Range.create(offsetToPosition(document.getText(), mappedDocEndOffset), offsetToPosition(document.getText(), mappedDocEndOffset));
-  }
-
-  return Range.create(
-    offsetToPosition(document.getText(), mappedDocStartOffset),
-    offsetToPosition(document.getText(), mappedDocEndOffset)
-  );
+  // If only one end could be mapped, we might return a zero-length range at that point, or null.
+  // For now, if either fails, the whole range mapping fails.
+  // console.warn("mapPurePugRangeToDocument: Could not map one or both positions of the range.");
+  return null;
 }
