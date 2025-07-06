@@ -20,9 +20,14 @@ import {
 import { TextDocument } from 'vscode-languageserver-textdocument';
 import * as acorn from 'acorn';
 
-import { IReactPugLanguageService, createReactPugLanguageService, PreprocessedPug } from './reactPugLanguageService'; // ReactPugSettings removed from direct import as ServiceReactPugSettings was unused
-import { mapDocumentPositionToPurePug, mapPurePugRangeToDocument } from './positionMapping';
-import { positionToOffset } from './utils/textPositions'; // Import positionToOffset
+import { IReactPugLanguageService, createReactPugLanguageService, PreprocessedPug } from './reactPugLanguageService';
+// Position mapping will change with JSX-centric approach, so these specific imports might change/remove.
+// For now, keep them if direct Pug analysis is a fallback.
+// import { mapDocumentPositionToPurePug, mapPurePugRangeToDocument } from './positionMapping';
+import { positionToOffset } from './utils/textPositions';
+import { compilePugToJsxString } from './pugToJsxTransformer';
+import { parseSourceMap, JsxPugSourceMapData } from './jsxPugMapping';
+
 
 const connection = createConnection(ProposedFeatures.all);
 const documents: TextDocuments<TextDocument> = new TextDocuments(TextDocument);
@@ -37,8 +42,11 @@ export interface PugLiteralInfo { // Export if used by positionMapping.ts direct
 
 let hasConfigurationCapability = false;
 let hasWorkspaceFolderCapability = false;
-// let hasDiagnosticRelatedInformationCapability = false; // Not actively used for custom diags
+// let hasDiagnosticRelatedInformationCapability = false;
 
+// Settings interfaces are now often defined in the service or shared
+// For server.ts, it primarily consumes them or passes them on.
+// Re-defining or importing if needed for strong typing here.
 interface ReactPugSettings {
   maxNumberOfProblems: number;
   classAttribute: string;
@@ -218,19 +226,81 @@ async function validateTextDocument(textDocument: TextDocument): Promise<void> {
   const pugLiterals = findPugLiterals(textDocument);
 
   for (const literal of pugLiterals) {
-    const rawPugInLiteral = textDocument.getText(literal.contentRange); // This is what preprocessPug expects
-    const preprocessed: PreprocessedPug = languageService.preprocessPug(rawPugInLiteral, literal.indentation, textDocument.uri);
-    const parsed = languageService.parsePug(preprocessed, textDocument.uri);
-    const pugDiagnostics = languageService.doValidation(parsed);
+    const rawPugInLiteral = textDocument.getText(literal.contentRange);
 
-    for (const diag of pugDiagnostics) {
-      const mappedRange = mapPurePugRangeToDocument(diag.range, literal, preprocessed.mappingData, textDocument);
-      if (mappedRange) {
-        diagnostics.push({ ...diag, range: mappedRange });
-      } else {
-        connection.console.warn(`Could not map diagnostic range for: ${diag.message} in ${textDocument.uri}`);
-        diagnostics.push({ ...diag, range: literal.contentRange, message: `(Unmapped) ${diag.message}` });
-      }
+    // Generate a unique filename for this literal for source map processing
+    const virtualPugFilename = `${textDocument.uri}/literal-${literal.contentRange.start.line}-${literal.contentRange.start.character}.pug`;
+    // The filename passed to babel needs to be what the source map will refer to as a source.
+    const virtualJsxInputFilename = `${virtualPugFilename}.virtual.js`;
+
+
+    connection.console.log(`Processing Pug literal at L${literal.contentRange.start.line} C${literal.contentRange.start.character}`);
+    connection.console.log(`Original Pug:\n${rawPugInLiteral}`);
+
+    const compileResult = compilePugToJsxString(rawPugInLiteral, { classAttribute: settings.classAttribute }, virtualJsxInputFilename);
+
+    if (compileResult.error) {
+      connection.console.error(`Pug to JSX compilation error: ${compileResult.error}`);
+      // Create a diagnostic for the whole Pug literal if compilation fails
+      diagnostics.push({
+        severity: DiagnosticSeverity.Error,
+        range: literal.contentRange,
+        message: `Pug to JSX compilation failed: ${compileResult.error}`,
+        source: 'React Pug Compiler',
+      });
+      continue; // Move to next literal
+    }
+
+    if (compileResult.jsx) {
+      connection.console.log(`Generated JSX:\n${compileResult.jsx}`);
+    }
+
+    if (compileResult.sourceMap) {
+      connection.console.log(`Source Map generated: Yes`);
+      // console.log(JSON.stringify(compileResult.sourceMap, null, 2)); // Detailed log
+
+      // Attempt to parse and use the source map (example, actual usage in diagnostics comes later)
+      // const smData = await parseSourceMap(compileResult.sourceMap, rawPugInLiteral, compileResult.jsx || "");
+      // if (smData) {
+      //   connection.console.log('Source map parsed successfully.');
+      //   // Example: try mapping a JSX position back to Pug (for future use)
+      //   // const jsxPos = Position.create(0,1); // e.g. <p> -> 'p'
+      //   // const pugPos = mapJsxPositionToPugPosition(jsxPos, smData);
+      //   // if (pugPos) {
+      //   //   connection.console.log(`JSX ${jsxPos.line}:${jsxPos.character} maps to Pug ${pugPos.line}:${pugPos.character}`);
+      //   // } else {
+      //   //   connection.console.log(`No mapping for JSX ${jsxPos.line}:${jsxPos.character}`);
+      //   // }
+      //   destroySourceMapData(smData); // Clean up
+      // } else {
+      //   connection.console.warn('Failed to parse generated source map.');
+      // }
+    } else {
+      connection.console.warn('No source map generated from Pug-to-JSX compilation.');
+    }
+
+    // TODO: Placeholder for getting diagnostics from a TS/JSX service on compileResult.jsx
+    // For now, we'll keep the old direct Pug parsing as a fallback or supplementary diagnostic source.
+    // This part will be removed/replaced when TS/JSX service integration happens (Phase 2)
+    if (languageService) { // languageService is for direct Pug parsing
+        const preprocessed: PreprocessedPug = languageService.preprocessPug(rawPugInLiteral, literal.indentation, textDocument.uri);
+        const parsed = languageService.parsePug(preprocessed, textDocument.uri);
+        const pugDiagnostics = languageService.doValidation(parsed);
+        for (const diag of pugDiagnostics) {
+            // const mappedRange = mapPurePugRangeToDocument(diag.range, literal, preprocessed.mappingData, textDocument);
+            // The mapPurePugRangeToDocument is for the old preprocessing. We need a fallback or different mapping for direct pug errors.
+            // For now, let's use the literal's contentRange if mapping direct pug errors.
+             diagnostics.push({
+                ...diag,
+                range: Range.create( // Adjust range to be within the document
+                    literal.contentRange.start.line + diag.range.start.line,
+                    (diag.range.start.line === 0 ? literal.contentRange.start.character : 0) + diag.range.start.character,
+                    literal.contentRange.start.line + diag.range.end.line,
+                    (diag.range.end.line === 0 ? literal.contentRange.start.character : 0) + diag.range.end.character
+                ),
+                message: `(Direct Pug) ${diag.message}`
+            });
+        }
     }
   }
   connection.sendDiagnostics({ uri: textDocument.uri, diagnostics });
@@ -242,48 +312,60 @@ connection.onCompletion(
     if (!document) return null;
 
     const settings = await getDocumentSettings(document.uri);
-    if (!languageService || globalSettings.classAttribute !== settings.classAttribute) {
-         languageService = createReactPugLanguageService(settings);
-    }
+    if (!languageService) languageService = createReactPugLanguageService(settings); // Old service for fallback
 
     const pugLiterals = findPugLiterals(document);
     for (const literal of pugLiterals) {
-      // Check if the documentPosition is within the literal's contentRange (where Pug code is)
       const docOffset = positionToOffset(document.getText(), textDocumentPosition.position);
       const literalContentStartOffset = positionToOffset(document.getText(), literal.contentRange.start);
       const literalContentEndOffset = positionToOffset(document.getText(), literal.contentRange.end);
 
       if (docOffset >= literalContentStartOffset && docOffset <= literalContentEndOffset) {
+        // TODO: New JSX-based completion logic will go here in Phase 2
+        // 1. Get Pug literal content: rawPugInLiteral
+        // 2. Map Pug cursor to equivalent conceptual JSX cursor position (using mapPugPositionToJsxPosition)
+        //    This requires a source map from Pug -> JSX.
+        // 3. Compile Pug to JSX: compileResult = compilePugToJsxString(...)
+        // 4. If compilation and source map are good:
+        //    const mapData = await parseSourceMap(compileResult.sourceMap, rawPugInLiteral, compileResult.jsx);
+        //    const jsxPosition = mapPugPositionToJsxPosition(pugCursorInLiteral, mapData);
+        //    If jsxPosition:
+        //       Get completions from TS/JSX service for virtual JSX at jsxPosition.
+        //       Map TextEdits in results from JSX ranges back to Pug ranges using mapJsxRangeToPugRange.
+        // For now, falling back to old direct Pug completion logic:
         const rawPugInLiteral = textDocument.getText(literal.contentRange);
         const preprocessed = languageService.preprocessPug(rawPugInLiteral, literal.indentation, document.uri);
         const parsed = languageService.parsePug(preprocessed, document.uri);
 
-        const positionInPurePug = mapDocumentPositionToPurePug(textDocumentPosition.position, literal, preprocessed.mappingData, document);
+        // const positionInPurePug = mapDocumentPositionToPurePug(textDocumentPosition.position, literal, preprocessed.mappingData, document);
+        // mapDocumentPositionToPurePug needs to be available/re-imported if used.
+        // For now, let's assume a direct use of the old service if we don't have JSX mapping yet.
+        // This part is now a placeholder for the JSX-based approach.
+        // If position mapping utilities for Pug source -> Pure Pug are still needed for this fallback:
+        // const positionInPurePug = oldMapDocumentPositionToPurePug(textDocumentPosition.position, literal, preprocessed.mappingData, document);
 
-        if (!positionInPurePug) {
-          connection.console.log(`Could not map document position to purePug position for completion.`);
+
+        // Fallback to simplified position mapping for the old service
+        let lineInPurePug = textDocumentPosition.position.line - literal.contentRange.start.line;
+        let charInPurePug = (lineInPurePug === 0) ?
+            textDocumentPosition.position.character - literal.contentRange.start.character :
+            textDocumentPosition.position.character;
+        // This simplified mapping doesn't account for indentation stripping by preprocessPug.
+        const positionInPurePugFallback = Position.create(Math.max(0,lineInPurePug), Math.max(0,charInPurePug));
+
+
+        if (!positionInPurePugFallback) {
+          connection.console.log(`Could not map document position to purePug position for completion (fallback).`);
           return null;
         }
 
-        const completionList = languageService.doComplete(parsed, positionInPurePug);
+        const completionList = languageService.doComplete(parsed, positionInPurePugFallback);
         if (completionList && completionList.items) {
           completionList.items.forEach(item => {
             if (item.textEdit && TextEdit.is(item.textEdit)) {
-              const mappedRange = mapPurePugRangeToDocument(item.textEdit.range, literal, preprocessed.mappingData, document);
-              if (mappedRange) {
-                item.textEdit.range = mappedRange;
-              } else {
-                connection.console.warn(`Could not map TextEdit range for completion item '${item.label}'.`);
-              }
-            } else if (item.textEdit) { // InsertReplaceEdit
-                const insertReplaceEdit = item.textEdit as {insert: Range, replace: Range, newText: string};
-                const mappedInsert = mapPurePugRangeToDocument(insertReplaceEdit.insert, literal, preprocessed.mappingData, document);
-                const mappedReplace = mapPurePugRangeToDocument(insertReplaceEdit.replace, literal, preprocessed.mappingData, document);
-                if(mappedInsert && mappedReplace) {
-                    item.textEdit = {newText: insertReplaceEdit.newText, insert: mappedInsert, replace: mappedReplace};
-                } else {
-                    connection.console.warn(`Could not map InsertReplaceEdit ranges for '${item.label}'.`);
-                }
+              // const mappedRange = oldMapPurePugRangeToDocument(item.textEdit.range, literal, preprocessed.mappingData, document);
+              // TextEdits will be inaccurately mapped with this fallback.
+               connection.console.warn(`TextEdit for '${item.label}' uses fallback mapping. May be inaccurate.`);
             }
           });
           return completionList;
@@ -301,9 +383,7 @@ connection.onHover(
     if (!document) return null;
 
     const settings = await getDocumentSettings(document.uri);
-     if (!languageService || globalSettings.classAttribute !== settings.classAttribute) {
-        languageService = createReactPugLanguageService(settings);
-    }
+     if (!languageService) languageService = createReactPugLanguageService(settings); // Old service
 
     const pugLiterals = findPugLiterals(document);
     for (const literal of pugLiterals) {
@@ -312,26 +392,29 @@ connection.onHover(
       const literalContentEndOffset = positionToOffset(document.getText(), literal.contentRange.end);
 
       if (docOffset >= literalContentStartOffset && docOffset <= literalContentEndOffset) {
+        // TODO: New JSX-based hover logic (similar to onCompletion)
+        // For now, falling back to old direct Pug hover logic:
         const rawPugInLiteral = document.getText(literal.contentRange);
         const preprocessed = languageService.preprocessPug(rawPugInLiteral, literal.indentation, document.uri);
         const parsed = languageService.parsePug(preprocessed, document.uri);
 
-        const positionInPurePug = mapDocumentPositionToPurePug(textDocumentPosition.position, literal, preprocessed.mappingData, document);
+        // const positionInPurePug = mapDocumentPositionToPurePug(textDocumentPosition.position, literal, preprocessed.mappingData, document);
+        // Fallback mapping:
+        let lineInPurePug = textDocumentPosition.position.line - literal.contentRange.start.line;
+        let charInPurePug = (lineInPurePug === 0) ?
+            textDocumentPosition.position.character - literal.contentRange.start.character :
+            textDocumentPosition.position.character;
+        const positionInPurePugFallback = Position.create(Math.max(0,lineInPurePug), Math.max(0,charInPurePug));
 
-        if (!positionInPurePug) {
-          connection.console.log(`Could not map document position to purePug position for hover.`);
+        if (!positionInPurePugFallback) {
           return null;
         }
 
-        const hoverResult = languageService.doHover(parsed, positionInPurePug);
+        const hoverResult = languageService.doHover(parsed, positionInPurePugFallback);
         if (hoverResult && hoverResult.range) {
-          const mappedRange = mapPurePugRangeToDocument(hoverResult.range, literal, preprocessed.mappingData, document);
-          if (mappedRange) {
-            hoverResult.range = mappedRange;
-          } else {
-            connection.console.warn(`Could not map hover range. Falling back to literal content range.`);
-            hoverResult.range = literal.contentRange;
-          }
+          // const mappedRange = mapPurePugRangeToDocument(hoverResult.range, literal, preprocessed.mappingData, document);
+          // Hover range will be inaccurately mapped with this fallback.
+           connection.console.warn(`Hover range for uses fallback mapping. May be inaccurate.`);
         }
         return hoverResult;
       }
