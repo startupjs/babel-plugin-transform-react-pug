@@ -5,7 +5,7 @@ import * as acorn from 'acorn';
 // Import functions to be tested - assuming they are exported or accessible for testing
 // This might require adjusting server.ts to export them for test environment
 let findPugLiterals;
-let extractDeclarationsFromScope;
+let extractDeclarationsAndParamsFromScope; // Renamed
 let serverModule;
 
 // Acorn's Node type is not explicitly exported in its main typing,

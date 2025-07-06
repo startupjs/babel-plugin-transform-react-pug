@@ -327,4 +327,132 @@ describe('onCompletion Handler', () => {
     // which are internal to server.ts. For now, the functional outcome (completion provided) is the main check.
   });
 
+  it('should provide completions for enclosing function parameters', async () => {
+    const pugContent = "p #{para}"; // User typing para...
+    const docContent = `
+      function TestComponentWithParams(paramA, paramB) {
+        // const localToFunc = "test";
+        return pug\`${pugContent}\`;
+      }
+    `;
+    const doc = createDoc('file:///test-func-params.tsx', docContent);
+    const literalContentRange = Range.create(3, 20, 3, 20 + pugContent.length); // Approximate
+
+    const programAst = acorn.parse(docContent, { ecmaVersion: 'latest', sourceType: 'module', locations:true });
+    const functionScopeNode = (programAst as any).body.find(n => n.type === 'FunctionDeclaration');
+
+    serverModule.documents = { get: jest.fn().mockReturnValue(doc) };
+    serverModule.findPugLiterals.mockReturnValue([{
+      content: pugContent,
+      contentRange: literalContentRange,
+      indentation: "  ",
+      enclosingScopeNode: functionScopeNode,
+    }]);
+
+    serverModule.extractImportStatements.mockReturnValue([]);
+    // Mock extractDeclarationsAndParamsFromScope to return dummy param declarations
+    jest.spyOn(serverModule, 'extractDeclarationsAndParamsFromScope').mockReturnValue({
+        declarations: [/* "const localToFunc = \"test\";" */],
+        paramTexts: ["let paramA: any;", "let paramB: any;"]
+    });
+
+    const generatedJsx = "<p>{para}</p>";
+    (compilePugToJsxString as jest.Mock).mockReturnValue({ jsx: generatedJsx, sourceMap: { version: 3, sources:[], mappings:'' } });
+
+    const mockMapData = { consumer: {}, originalPugContent: pugContent, generatedJsxContent: generatedJsx };
+    (parseSourceMap as jest.Mock).mockResolvedValue(mockMapData);
+
+    const cursorPugPosition = Position.create(0, pugContent.indexOf('para') + 'para'.length);
+    const mappedJsxPosition = Position.create(0, generatedJsx.indexOf('para') + 'para'.length);
+    (mapPugPositionToJsxPosition as jest.Mock).mockReturnValue(mappedJsxPosition);
+
+    const jsxOffset = 150; // Dummy offset
+    (positionToOffset as jest.Mock).mockReturnValue(jsxOffset);
+
+    mockTsLangService.getCompletionsAtPosition.mockImplementation((filename, offset, options) => {
+      // Simulate TS service finding 'paramA' and 'paramB' due to their dummy declarations
+      return {
+        entries: [
+          { name: 'paramA', kind: ts.ScriptElementKind.parameterElement },
+          { name: 'paramB', kind: ts.ScriptElementKind.parameterElement },
+        ],
+      };
+    });
+    mockTsLangService.getCompletionEntryDetails.mockImplementation(({name, kind}) => ({ // Ensure destructuring of args
+        name, kind, displayParts: [{text: name, kind:'parameterName'}]
+    }));
+
+    const requestPosition = Position.create(3, 20 + cursorPugPosition.character);
+    const result = await onCompletionHandler({ textDocument: { uri: doc.uri }, position: requestPosition });
+
+    expect(serverModule.extractDeclarationsAndParamsFromScope).toHaveBeenCalledWith(functionScopeNode, docContent);
+    expect(result).not.toBeNull();
+    expect(result).toHaveLength(2);
+    expect(result.find(item => item.label === 'paramA')).toBeDefined();
+    expect(result.find(item => item.label === 'paramB')).toBeDefined();
+    expect(result[0].kind).toBe(CompletionItemKind.Variable); // Parameters are often treated as variables by LSP kind
+  });
+
+  describe('TextEdit newText transformation', () => {
+    // Re-mock transformJsxSnippetToPug for specific tests if needed, or rely on its actual import
+    // For these tests, we'll assume the actual transformJsxSnippetToPug is imported and works as per its own unit tests.
+
+    it('should use transformed Pug snippet for newText if transformation is successful', async () => {
+      const pugContent = "My";
+      const doc = createDoc('file:///test-transform.tsx', `pug\`${pugContent}\``);
+      const literalContentRange = Range.create(0, 4, 0, 4 + pugContent.length);
+      serverModule.documents = { get: jest.fn().mockReturnValue(doc) };
+      serverModule.findPugLiterals.mockReturnValue([{ content: pugContent, contentRange: literalContentRange, enclosingScopeNode: {type: 'Program', body: []} }]);
+      serverModule.extractImportStatements.mockReturnValue([]);
+      serverModule.extractDeclarationsAndParamsFromScope.mockReturnValue({declarations:[], paramTexts:[]});
+
+
+      const jsxToInsert = "<MyComponent />";
+      const expectedPugInsert = "MyComponent/"; // From transformJsxSnippetToPug
+
+      (compilePugToJsxString as jest.Mock).mockReturnValue({ jsx: "<My/>", sourceMap: { version: 3, sources:[], mappings:'' }});
+      (mapPugPositionToJsxPosition as jest.Mock).mockReturnValue(Position.create(0,3)); // Cursor after <My|/>
+      (positionToOffset as jest.Mock).mockReturnValue(3);
+
+      mockTsLangService.getCompletionsAtPosition.mockReturnValue({ entries: [{ name: 'MyComponent', kind: ts.ScriptElementKind.classElement }] });
+      mockTsLangService.getCompletionEntryDetails.mockReturnValue({
+        name: 'MyComponent', kind: ts.ScriptElementKind.classElement, displayParts: [],
+        codeActions: [{ changes: [{ fileName: `${doc.uri}/literal-0.pug.virtual.tsx`, textChanges: [{ span: { start: 3, length: 0 }, newText: jsxToInsert }] }] }]
+      });
+      mockTsLangService.getProgram().getSourceFile.mockReturnValue({ text: `() => <My/>`, fileName: `${doc.uri}/literal-0.pug.virtual.tsx` });
+      mockTs.getLineAndCharacterOfPosition.mockReturnValue({line:0, character:3}); // For span start and end
+      (mapJsxRangeToPugRange as jest.Mock).mockReturnValue(Range.create(0,2,0,2)); // Range in Pug for "My"
+
+      const result = await onCompletionHandler({ textDocument: { uri: doc.uri }, position: Position.create(0, 4 + pugContent.length) });
+      expect(result[0].textEdit.newText).toBe(expectedPugInsert);
+    });
+
+    it('should use original JSX newText if transformation returns null', async () => {
+      const pugContent = "data={";
+      const doc = createDoc('file:///test-no-transform.tsx', `pug\`${pugContent}\``);
+      const literalContentRange = Range.create(0, 4, 0, 4 + pugContent.length);
+      serverModule.documents = { get: jest.fn().mockReturnValue(doc) };
+      serverModule.findPugLiterals.mockReturnValue([{ content: pugContent, contentRange: literalContentRange, enclosingScopeNode: {type: 'Program', body: []} }]);
+      serverModule.extractImportStatements.mockReturnValue([]);
+      serverModule.extractDeclarationsAndParamsFromScope.mockReturnValue({declarations:[], paramTexts:[]});
+
+      const jsxToInsert = "{complexObject}"; // Assume transformJsxSnippetToPug returns null for this
+
+      (compilePugToJsxString as jest.Mock).mockReturnValue({ jsx: "data={}", sourceMap: { version: 3, sources:[], mappings:'' }});
+      (mapPugPositionToJsxPosition as jest.Mock).mockReturnValue(Position.create(0,6)); // Cursor after data={|}
+      (positionToOffset as jest.Mock).mockReturnValue(6);
+
+      mockTsLangService.getCompletionsAtPosition.mockReturnValue({ entries: [{ name: 'complexObject', kind: ts.ScriptElementKind.variableElement }] });
+      mockTsLangService.getCompletionEntryDetails.mockReturnValue({
+        name: 'complexObject', kind: ts.ScriptElementKind.variableElement, displayParts: [],
+        codeActions: [{ changes: [{ fileName: `${doc.uri}/literal-0.pug.virtual.tsx`, textChanges: [{ span: { start: 6, length: 0 }, newText: jsxToInsert }] }] }]
+      });
+      mockTsLangService.getProgram().getSourceFile.mockReturnValue({ text: `() => data={}`, fileName: `${doc.uri}/literal-0.pug.virtual.tsx`});
+      mockTs.getLineAndCharacterOfPosition.mockReturnValue({line:0, character:6});
+      (mapJsxRangeToPugRange as jest.Mock).mockReturnValue(Range.create(0,6,0,6));
+
+      const result = await onCompletionHandler({ textDocument: { uri: doc.uri }, position: Position.create(0, 4 + pugContent.length) });
+      expect(result[0].textEdit.newText).toBe(jsxToInsert); // Falls back to original JSX
+    });
+  });
 });

@@ -20,7 +20,7 @@ import { DiagnosticSeverity } from 'vscode-languageserver-types';
 
 import { TextDocument } from 'vscode-languageserver-textdocument';
 import * as acorn from 'acorn';
-import * as walk from 'acorn-walk'; // Import acorn-walk
+import * as walk from 'acorn-walk';
 import * as ts from 'typescript';
 import { pathToFileURL } from 'url';
 
@@ -28,9 +28,16 @@ import { IReactPugLanguageService, createReactPugLanguageService } from './react
 import { positionToOffset } from './utils/textPositions';
 import { compilePugToJsxString, PugToJsxResult } from './pugToJsxTransformer';
 import { parseSourceMap, mapJsxRangeToPugRange, mapPugPositionToJsxPosition, destroySourceMapData } from './jsxPugMapping';
+import { transformJsxSnippetToPug } from './utils/jsxToPugSnippet'; // Import the new transformer
 
 const connection = createConnection(ProposedFeatures.all);
 const documents: TextDocuments<TextDocument> = new TextDocuments(TextDocument);
+
+// Cache for Acorn ASTs
+const astCache = new Map<string, { version: number, ast: acorn.Node }>();
+
+// Cache for Pug compilation results
+const pugCompilationCache = new Map<string, PugToJsxResult>();
 
 const virtualFiles = new Map<string, { version: number, snapshot: ts.IScriptSnapshot, content: string }>();
 
@@ -66,7 +73,7 @@ export interface PugLiteralInfo {
   range: Range;
   contentRange: Range;
   indentation: string;
-  enclosingScopeNode?: acorn.Node; // AST node of the enclosing function/block
+  enclosingScopeNode?: acorn.Node;
 }
 
 interface ReactPugSettings {
@@ -78,20 +85,17 @@ const defaultSettings: ReactPugSettings = { maxNumberOfProblems: 100, classAttri
 let globalSettings: ReactPugSettings = defaultSettings;
 const documentSettings: Map<string, Thenable<ReactPugSettings>> = new Map();
 let oldPugLanguageService: IReactPugLanguageService;
-
 let hasConfigurationCapability = false;
 
 connection.onInitialize((params: InitializeParams) => {
   const capabilities = params.capabilities;
   hasConfigurationCapability = !!(capabilities.workspace && !!capabilities.workspace.configuration);
-
   let initialSettings = { ...globalSettings };
   if (params.initializationOptions?.classAttribute) {
     initialSettings.classAttribute = params.initializationOptions.classAttribute;
   }
   oldPugLanguageService = createReactPugLanguageService(initialSettings);
   globalSettings = initialSettings;
-
   connection.console.log('React Pug Language Server initialized.');
   const result: InitializeResult = {
     capabilities: {
@@ -150,14 +154,9 @@ function findPugLiterals(textDocument: TextDocument): PugLiteralInfo[] {
   const text = textDocument.getText();
   try {
     const ast = acorn.parse(text, {
-      ecmaVersion: 'latest',
-      sourceType: 'module',
-      locations: true,
-      allowReturnOutsideFunction: true,
-      allowImportExportEverywhere: true,
-      allowAwaitOutsideFunction: true,
-      allowSuperOutsideMethod: true,
-      allowHashBang: true,
+      ecmaVersion: 'latest', sourceType: 'module', locations: true,
+      allowReturnOutsideFunction: true, allowImportExportEverywhere: true,
+      allowAwaitOutsideFunction: true, allowSuperOutsideMethod: true, allowHashBang: true,
     }) as acorn.Node;
 
     walk.ancestor(ast, {
@@ -168,58 +167,33 @@ function findPugLiterals(textDocument: TextDocument): PugLiteralInfo[] {
             const nodeStartPosition = Position.create(ttNode.loc.start.line - 1, ttNode.loc.start.column);
             const nodeEndPosition = Position.create(ttNode.loc.end.line - 1, ttNode.loc.end.column);
             const nodeRange = Range.create(nodeStartPosition, nodeEndPosition);
-
             const contentStartPosition = Position.create(ttNode.quasi.loc.start.line - 1, ttNode.quasi.loc.start.column + 1);
             const contentEndPosition = Position.create(ttNode.quasi.loc.end.line - 1, ttNode.quasi.loc.end.column - 1);
             const contentRange = Range.create(contentStartPosition, contentEndPosition);
-
             let extractedContent = "";
             for (let i = 0; i < ttNode.quasi.quasis.length; i++) {
               const quasi = ttNode.quasi.quasis[i];
-              const quasiStartPos = Position.create(quasi.loc.start.line - 1, quasi.loc.start.column);
-              const quasiEndPos = Position.create(quasi.loc.end.line - 1, quasi.loc.end.column);
-              extractedContent += textDocument.getText(Range.create(quasiStartPos, quasiEndPos));
-
+              extractedContent += textDocument.getText(Range.create(Position.create(quasi.loc.start.line - 1, quasi.loc.start.column), Position.create(quasi.loc.end.line - 1, quasi.loc.end.column)));
               if (i < ttNode.quasi.expressions.length) {
                 const expr = ttNode.quasi.expressions[i];
-                const exprStartPos = Position.create(expr.loc.start.line - 1, expr.loc.start.column);
-                const exprEndPos = Position.create(expr.loc.end.line - 1, expr.loc.end.column);
-                extractedContent += `\${${textDocument.getText(Range.create(exprStartPos, exprEndPos))}}`;
+                extractedContent += `\${${textDocument.getText(Range.create(Position.create(expr.loc.start.line - 1, expr.loc.start.column), Position.create(expr.loc.end.line - 1, expr.loc.end.column)))}}`;
               }
             }
-
             let indentation = "";
             const lineOfOpeningBacktick = contentStartPosition.line;
-            const textBeforeBacktick = textDocument.getText(Range.create(
-              Position.create(lineOfOpeningBacktick, 0),
-              Position.create(lineOfOpeningBacktick, contentStartPosition.character -1)
-            ));
+            const textBeforeBacktick = textDocument.getText(Range.create(Position.create(lineOfOpeningBacktick, 0), Position.create(lineOfOpeningBacktick, contentStartPosition.character -1)));
             const match = textBeforeBacktick.match(/^(\s*)/);
-            if (match) {
-              indentation = match[1];
-            }
+            if (match) indentation = match[1];
 
             let enclosingScopeNode: acorn.Node | undefined = undefined;
             for (let i = ancestors.length - 2; i >= 0; i--) {
               const ancestorNode = ancestors[i];
-              if (
-                ancestorNode.type === 'FunctionDeclaration' ||
-                ancestorNode.type === 'FunctionExpression' ||
-                ancestorNode.type === 'ArrowFunctionExpression' ||
-                ancestorNode.type === 'BlockStatement' ||
-                ancestorNode.type === 'Program'
-              ) {
+              if (['FunctionDeclaration', 'FunctionExpression', 'ArrowFunctionExpression', 'BlockStatement', 'Program'].includes(ancestorNode.type)) {
                 enclosingScopeNode = ancestorNode;
                 break;
               }
             }
-            results.push({
-              content: extractedContent,
-              range: nodeRange,
-              contentRange: contentRange,
-              indentation: indentation,
-              enclosingScopeNode: enclosingScopeNode
-            });
+            results.push({ content: extractedContent, range: nodeRange, contentRange: contentRange, indentation: indentation, enclosingScopeNode });
           }
         }
       }
@@ -230,49 +204,56 @@ function findPugLiterals(textDocument: TextDocument): PugLiteralInfo[] {
   return results;
 }
 
-function extractDeclarationsFromScope(scopeNode: acorn.Node | undefined, documentText: string): string[] {
-  if (!scopeNode) return [];
-  const declarations: string[] = [];
-  let nodesToWalk: acorn.Node[] = [];
+function extractDeclarationsAndParamsFromScope(scopeNode: acorn.Node | undefined, documentText: string): { declarations: string[], paramTexts: string[] } {
+  const result = { declarations: [] as string[], paramTexts: [] as string[] };
+  if (!scopeNode) return result;
 
-  if (scopeNode.type === 'FunctionDeclaration' || scopeNode.type === 'FunctionExpression' || scopeNode.type === 'ArrowFunctionExpression') {
+  let bodyNodes: acorn.Node[] = [];
+
+  if (['FunctionDeclaration', 'FunctionExpression', 'ArrowFunctionExpression'].includes(scopeNode.type)) {
     const funcNode = scopeNode as any;
-    if (funcNode.body && funcNode.body.type === 'BlockStatement' && Array.isArray(funcNode.body.body)) {
-      nodesToWalk = funcNode.body.body;
+    if (Array.isArray(funcNode.params)) {
+      for (const param of funcNode.params) {
+        // For simplicity, create 'let paramName: any;' for each.
+        // More complex destructuring or default values would need more handling.
+        if (param.type === 'Identifier') {
+          result.paramTexts.push(`let ${param.name}: any;`);
+        } else if (param.type === 'AssignmentPattern' && param.left.type === 'Identifier') {
+          result.paramTexts.push(`let ${param.left.name}: any;`); // Default value not included in dummy declaration
+        }
+        // TODO: Handle ObjectPattern, ArrayPattern for destructured params
+      }
     }
-  } else if ((scopeNode.type === 'BlockStatement' || scopeNode.type === 'Program') && Array.isArray((scopeNode as any).body)) {
-    nodesToWalk = (scopeNode as any).body;
+    if (funcNode.body && funcNode.body.type === 'BlockStatement' && Array.isArray(funcNode.body.body)) {
+      bodyNodes = funcNode.body.body;
+    }
+  } else if (['BlockStatement', 'Program'].includes(scopeNode.type) && Array.isArray((scopeNode as any).body)) {
+    bodyNodes = (scopeNode as any).body;
   }
 
-  for (const node of nodesToWalk) {
-    if (node.type === 'VariableDeclaration' || node.type === 'FunctionDeclaration') {
+  for (const node of bodyNodes) {
+    if (['VariableDeclaration', 'FunctionDeclaration'].includes(node.type)) {
       if (typeof (node as any).start === 'number' && typeof (node as any).end === 'number') {
-        declarations.push(documentText.substring((node as any).start, (node as any).end));
+        result.declarations.push(documentText.substring((node as any).start, (node as any).end));
       }
     }
   }
-  return declarations;
+  return result;
 }
 
 function extractImportStatements(document: TextDocument): string[] {
   const importStatements: string[] = [];
   try {
     const ast = acorn.parse(document.getText(), {
-      ecmaVersion: 'latest',
-      sourceType: 'module',
-      locations: true,
-      allowReturnOutsideFunction: true,
-      allowImportExportEverywhere: true,
-      allowAwaitOutsideFunction: true,
-      allowSuperOutsideMethod: true,
-      allowHashBang: true,
+      ecmaVersion: 'latest', sourceType: 'module', locations: true,
+      allowReturnOutsideFunction: true, allowImportExportEverywhere: true,
+      allowAwaitOutsideFunction: true, allowSuperOutsideMethod: true, allowHashBang: true,
     });
     const body = (ast as any).body || ((ast as any).program ? (ast as any).program.body : []);
     for (const node of body) {
       if (node.type === 'ImportDeclaration') {
         if (typeof node.start === 'number' && typeof node.end === 'number') {
-            const importText = document.getText().substring(node.start, node.end);
-            importStatements.push(importText);
+            importStatements.push(document.getText().substring(node.start, node.end));
         }
       }
     }
@@ -293,7 +274,7 @@ async function validateTextDocument(textDocument: TextDocument): Promise<void> {
   for (const literal of pugLiterals) {
     const rawPugInLiteral = literal.content;
     const currentLiteralIndex = literalIndex++;
-    const localDeclarations = extractDeclarationsFromScope(literal.enclosingScopeNode, documentText);
+    const { declarations: localDeclarations, paramTexts: localParamTexts } = extractDeclarationsAndParamsFromScope(literal.enclosingScopeNode, documentText);
 
     const babelInputFilename = `${textDocument.uri}/literal-${currentLiteralIndex}.pug.virtual.js`;
     const virtualTsxFilename = `${textDocument.uri}/literal-${currentLiteralIndex}.pug.virtual.tsx`;
@@ -302,16 +283,15 @@ async function validateTextDocument(textDocument: TextDocument): Promise<void> {
 
     if (compileResult.error || !compileResult.jsx || !compileResult.sourceMap) {
       diagnostics.push({
-        severity: DiagnosticSeverity.Error,
-        range: literal.contentRange,
-        message: `Pug to JSX compilation failed: ${compileResult.error || 'Unknown compilation error or missing JSX/SourceMap.'}`,
-        source: 'React Pug (Compiler)',
+        severity: DiagnosticSeverity.Error, range: literal.contentRange,
+        message: `Pug to JSX compilation failed: ${compileResult.error || 'Unknown error.'}`, source: 'React Pug (Compiler)',
       });
       continue;
     }
 
     const virtualTsxContent = `
 ${importStatements.join('\n')}
+${localParamTexts.join('\n')}
 ${localDeclarations.join('\n')}
 import React from 'react';
 const PugComponent = () => (<>${compileResult.jsx}</>);
@@ -319,75 +299,49 @@ export default PugComponent;
     `;
     updateVirtualFile(virtualTsxFilename, virtualTsxContent);
 
-    const tsSyntacticDiagnostics = tsLangService.getSyntacticDiagnostics(virtualTsxFilename);
-    const tsSemanticDiagnostics = tsLangService.getSemanticDiagnostics(virtualTsxFilename);
-    const allTsDiagnostics = [...tsSyntacticDiagnostics, ...tsSemanticDiagnostics];
+    const allTsDiagnostics = [
+      ...tsLangService.getSyntacticDiagnostics(virtualTsxFilename),
+      ...tsLangService.getSemanticDiagnostics(virtualTsxFilename)
+    ];
 
     const mapData = await parseSourceMap(compileResult.sourceMap, rawPugInLiteral, compileResult.jsx);
-
     if (!mapData) {
-      allTsDiagnostics.forEach(tsDiag => {
-        diagnostics.push({
-          severity: tsDiag.category === ts.DiagnosticCategory.Error ? DiagnosticSeverity.Error :
-                      tsDiag.category === ts.DiagnosticCategory.Warning ? DiagnosticSeverity.Warning :
-                      tsDiag.category === ts.DiagnosticCategory.Suggestion ? DiagnosticSeverity.Hint :
-                      DiagnosticSeverity.Information,
-          range: literal.contentRange,
-          message: `(Unmapped TSX) ${ts.flattenDiagnosticMessageText(tsDiag.messageText, '\n')}`,
-          source: 'React Pug (TS)',
-          code: tsDiag.code
-        });
-      });
+      allTsDiagnostics.forEach(tsDiag => diagnostics.push({
+        severity: tsDiag.category === ts.DiagnosticCategory.Error ? DiagnosticSeverity.Error : DiagnosticSeverity.Warning,
+        range: literal.contentRange, message: `(Unmapped TSX) ${ts.flattenDiagnosticMessageText(tsDiag.messageText, '\n')}`,
+        source: 'React Pug (TS)', code: tsDiag.code
+      }));
       continue;
     }
 
     for (const tsDiag of allTsDiagnostics) {
       if (tsDiag.start === undefined || tsDiag.length === undefined) continue;
       const sourceFile = tsLangService.getProgram()?.getSourceFile(virtualTsxFilename);
-      let finalJsxDiagRange: Range | undefined = undefined;
-
-      if (sourceFile) {
-        const startLoc = ts.getLineAndCharacterOfPosition(sourceFile, tsDiag.start);
-        const endLoc = ts.getLineAndCharacterOfPosition(sourceFile, tsDiag.start + tsDiag.length);
-        finalJsxDiagRange = Range.create(startLoc.line, startLoc.character, endLoc.line, endLoc.character);
-      } else {
-         diagnostics.push({
-            severity: DiagnosticSeverity.Warning,
-            range: literal.contentRange,
-            message: `(Internal Error) Could not map TSX diagnostic for: ${ts.flattenDiagnosticMessageText(tsDiag.messageText, '\n')}`,
-            source: 'React Pug (Mapping)',
-         });
-         continue;
+      if (!sourceFile) {
+        diagnostics.push({ severity: DiagnosticSeverity.Warning, range: literal.contentRange, message: `(Internal Error) No sourceFile for ${virtualTsxFilename}`, source: 'React Pug (Mapping)'});
+        continue;
       }
+      const startLoc = ts.getLineAndCharacterOfPosition(sourceFile, tsDiag.start);
+      const endLoc = ts.getLineAndCharacterOfPosition(sourceFile, tsDiag.start + tsDiag.length);
+      const finalJsxDiagRange = Range.create(startLoc.line, startLoc.character, endLoc.line, endLoc.character);
+      const pugRange = mapJsxRangeToPugRange(finalJsxDiagRange, mapData);
 
-      if (finalJsxDiagRange) {
-        const pugRange = mapJsxRangeToPugRange(finalJsxDiagRange, mapData);
-        if (pugRange) {
-          const docRelativePugRange = Range.create(
+      if (pugRange) {
+        diagnostics.push({
+          severity: tsDiag.category === ts.DiagnosticCategory.Error ? DiagnosticSeverity.Error : DiagnosticSeverity.Warning,
+          range: Range.create(
             literal.contentRange.start.line + pugRange.start.line,
             (pugRange.start.line === 0 ? literal.contentRange.start.character : 0) + pugRange.start.character,
             literal.contentRange.start.line + pugRange.end.line,
             (pugRange.end.line === 0 ? literal.contentRange.start.character : 0) + pugRange.end.character
-          );
-          diagnostics.push({
-            severity: tsDiag.category === ts.DiagnosticCategory.Error ? DiagnosticSeverity.Error :
-                        tsDiag.category === ts.DiagnosticCategory.Warning ? DiagnosticSeverity.Warning :
-                        tsDiag.category === ts.DiagnosticCategory.Suggestion ? DiagnosticSeverity.Hint :
-                        DiagnosticSeverity.Information,
-            range: docRelativePugRange,
-            message: ts.flattenDiagnosticMessageText(tsDiag.messageText, '\n'),
-            source: 'React Pug (TS)',
-            code: tsDiag.code,
-          });
-        } else {
-           diagnostics.push({
-            severity: DiagnosticSeverity.Warning,
-            range: literal.contentRange,
-            message: `(Unmapped TSX) ${ts.flattenDiagnosticMessageText(tsDiag.messageText, '\n')}`,
-            source: 'React Pug (TS Mapping)',
-            code: tsDiag.code
-          });
-        }
+          ),
+          message: ts.flattenDiagnosticMessageText(tsDiag.messageText, '\n'), source: 'React Pug (TS)', code: tsDiag.code,
+        });
+      } else {
+        diagnostics.push({
+          severity: DiagnosticSeverity.Warning, range: literal.contentRange,
+          message: `(Unmapped TSX) ${ts.flattenDiagnosticMessageText(tsDiag.messageText, '\n')}`, source: 'React Pug (TS Mapping)', code: tsDiag.code
+        });
       }
     }
     destroySourceMapData(mapData);
@@ -399,7 +353,6 @@ connection.onCompletion(
   async (textDocumentPosition: TextDocumentPositionParams): Promise<CompletionItem[] | null> => {
     const document = documents.get(textDocumentPosition.textDocument.uri);
     if (!document) return null;
-
     const settings = await getDocumentSettings(document.uri);
     const pugLiterals = findPugLiterals(document);
     const importStatements = extractImportStatements(document);
@@ -408,39 +361,30 @@ connection.onCompletion(
 
     for (const literal of pugLiterals) {
       const currentLiteralIndex = literalIndex++;
-      const docOffset = positionToOffset(document.getText(), textDocumentPosition.position);
-      const literalContentStartOffset = positionToOffset(document.getText(), literal.contentRange.start);
-      const literalContentEndOffset = positionToOffset(document.getText(), literal.contentRange.end);
+      const docOffset = positionToOffset(documentText, textDocumentPosition.position);
+      const literalContentStartOffset = positionToOffset(documentText, literal.contentRange.start);
+      const literalContentEndOffset = positionToOffset(documentText, literal.contentRange.end);
 
       if (docOffset >= literalContentStartOffset && docOffset <= literalContentEndOffset) {
         const rawPugInLiteral = literal.content;
-        const localDeclarations = extractDeclarationsFromScope(literal.enclosingScopeNode, documentText);
+        const { declarations: localDeclarations, paramTexts: localParamTexts } = extractDeclarationsAndParamsFromScope(literal.enclosingScopeNode, documentText);
         const cursorPugPosition = Position.create(
           textDocumentPosition.position.line - literal.contentRange.start.line,
           textDocumentPosition.position.character - (textDocumentPosition.position.line === literal.contentRange.start.line ? literal.contentRange.start.character : 0)
         );
-
         const babelInputFilename = `${document.uri}/literal-${currentLiteralIndex}.pug.virtual.js`;
         const virtualTsxFilename = `${document.uri}/literal-${currentLiteralIndex}.pug.virtual.tsx`;
-
         const compileResult = compilePugToJsxString(rawPugInLiteral, { classAttribute: settings.classAttribute }, babelInputFilename);
-        if (compileResult.error || !compileResult.jsx || !compileResult.sourceMap) {
-          continue;
-        }
 
+        if (compileResult.error || !compileResult.jsx || !compileResult.sourceMap) continue;
         const mapData = await parseSourceMap(compileResult.sourceMap, rawPugInLiteral, compileResult.jsx);
-        if (!mapData) {
-          continue;
-        }
-
+        if (!mapData) continue;
         const jsxPosition = mapPugPositionToJsxPosition(cursorPugPosition, mapData);
-        if (!jsxPosition) {
-          destroySourceMapData(mapData);
-          continue;
-        }
+        if (!jsxPosition) { destroySourceMapData(mapData); continue; }
 
         const virtualTsxContent = `
 ${importStatements.join('\n')}
+${localParamTexts.join('\n')}
 ${localDeclarations.join('\n')}
 import React from 'react';
 const PugComponent = () => (<>${compileResult.jsx}</>);
@@ -448,49 +392,34 @@ export default PugComponent;
         `;
         updateVirtualFile(virtualTsxFilename, virtualTsxContent);
         const jsxOffset = positionToOffset(virtualTsxContent, jsxPosition);
-
         const tsCompletions = tsLangService.getCompletionsAtPosition(virtualTsxFilename, jsxOffset, undefined);
-        if (!tsCompletions || !tsCompletions.entries) {
-          destroySourceMapData(mapData);
-          return null;
-        }
+
+        if (!tsCompletions || !tsCompletions.entries) { destroySourceMapData(mapData); return null; }
 
         const lspCompletionItems: CompletionItem[] = [];
         const tsProgram = tsLangService.getProgram();
-
         for (const entry of tsCompletions.entries) {
-          const details = tsLangService.getCompletionEntryDetails(
-            virtualTsxFilename, jsxOffset, entry.name, undefined, entry.source, undefined, entry.data
-          );
+          const details = tsLangService.getCompletionEntryDetails(virtualTsxFilename, jsxOffset, entry.name, undefined, entry.source, undefined, entry.data);
           const lspItem: CompletionItem = {
-            label: entry.name,
-            kind: mapTsCompletionKindToLspKind(entry.kind),
+            label: entry.name, kind: mapTsCompletionKindToLspKind(entry.kind),
             detail: details?.displayParts ? displayPartsToString(details.displayParts) : undefined,
             documentation: details?.documentation ? displayPartsToString(details.documentation) : undefined,
           };
-
-          if (details?.codeActions && details.codeActions.length > 0) {
-            const firstAction = details.codeActions[0];
-            if (firstAction.changes.length > 0) {
-              const firstFileTextChange = firstAction.changes[0];
-              if (firstFileTextChange.fileName === virtualTsxFilename && firstFileTextChange.textChanges.length > 0) {
-                const tsTextChange = firstFileTextChange.textChanges[0];
-                const jsxSourceFile = tsProgram?.getSourceFile(virtualTsxFilename);
-                if (jsxSourceFile) {
-                  const startLoc = ts.getLineAndCharacterOfPosition(jsxSourceFile, tsTextChange.span.start);
-                  const endLoc = ts.getLineAndCharacterOfPosition(jsxSourceFile, tsTextChange.span.start + tsTextChange.span.length);
-                  const jsxRange = Range.create(startLoc.line, startLoc.character, endLoc.line, endLoc.character);
-                  const pugRange = mapJsxRangeToPugRange(jsxRange, mapData);
-                  if (pugRange) {
-                    const docRelativePugRange = Range.create(
-                      literal.contentRange.start.line + pugRange.start.line,
-                      (pugRange.start.line === 0 ? literal.contentRange.start.character : 0) + pugRange.start.character,
-                      literal.contentRange.start.line + pugRange.end.line,
-                      (pugRange.end.line === 0 ? literal.contentRange.start.character : 0) + pugRange.end.character
-                    );
-                    lspItem.textEdit = TextEdit.replace(docRelativePugRange, tsTextChange.newText);
-                  }
-                }
+          if (details?.codeActions?.length && details.codeActions[0].changes?.length && firstFileChangeIsCurrent(details.codeActions[0].changes[0], virtualTsxFilename)) {
+            const tsTextChange = details.codeActions[0].changes[0].textChanges[0];
+            const jsxSourceFile = tsProgram?.getSourceFile(virtualTsxFilename);
+            if (jsxSourceFile && tsTextChange) {
+              const startLoc = ts.getLineAndCharacterOfPosition(jsxSourceFile, tsTextChange.span.start);
+              const endLoc = ts.getLineAndCharacterOfPosition(jsxSourceFile, tsTextChange.span.start + tsTextChange.span.length);
+              const jsxRange = Range.create(startLoc.line, startLoc.character, endLoc.line, endLoc.character);
+              const pugRange = mapJsxRangeToPugRange(jsxRange, mapData);
+              if (pugRange) {
+                lspItem.textEdit = TextEdit.replace(Range.create(
+                  literal.contentRange.start.line + pugRange.start.line,
+                  (pugRange.start.line === 0 ? literal.contentRange.start.character : 0) + pugRange.start.character,
+                  literal.contentRange.start.line + pugRange.end.line,
+                  (pugRange.end.line === 0 ? literal.contentRange.start.character : 0) + pugRange.end.character
+                ), tsTextChange.newText);
               }
             }
           }
@@ -504,7 +433,12 @@ export default PugComponent;
   }
 );
 
+function firstFileChangeIsCurrent(change: ts.FileTextChanges, virtualTsxFilename: string): boolean {
+    return change.fileName === virtualTsxFilename && change.textChanges.length > 0;
+}
+
 function mapTsCompletionKindToLspKind(tsKind: ts.ScriptElementKind): CompletionItemKind {
+  // ... (implementation as previously defined)
   switch (tsKind) {
     case ts.ScriptElementKind.moduleElement: case ts.ScriptElementKind.externalModuleName: return CompletionItemKind.Module;
     case ts.ScriptElementKind.classElement: return CompletionItemKind.Class;
@@ -529,7 +463,6 @@ connection.onHover(
   async (textDocumentPosition: TextDocumentPositionParams): Promise<Hover | null> => {
     const document = documents.get(textDocumentPosition.textDocument.uri);
     if (!document) return null;
-
     const settings = await getDocumentSettings(document.uri);
     const pugLiterals = findPugLiterals(document);
     const importStatements = extractImportStatements(document);
@@ -538,39 +471,30 @@ connection.onHover(
 
     for (const literal of pugLiterals) {
       const currentLiteralIndex = literalIndex++;
-      const docOffset = positionToOffset(document.getText(), textDocumentPosition.position);
-      const literalContentStartOffset = positionToOffset(document.getText(), literal.contentRange.start);
-      const literalContentEndOffset = positionToOffset(document.getText(), literal.contentRange.end);
+      const docOffset = positionToOffset(documentText, textDocumentPosition.position);
+      const literalContentStartOffset = positionToOffset(documentText, literal.contentRange.start);
+      const literalContentEndOffset = positionToOffset(documentText, literal.contentRange.end);
 
       if (docOffset >= literalContentStartOffset && docOffset <= literalContentEndOffset) {
         const rawPugInLiteral = literal.content;
-        const localDeclarations = extractDeclarationsFromScope(literal.enclosingScopeNode, documentText);
+        const { declarations: localDeclarations, paramTexts: localParamTexts } = extractDeclarationsAndParamsFromScope(literal.enclosingScopeNode, documentText);
         const cursorPugPosition = Position.create(
           textDocumentPosition.position.line - literal.contentRange.start.line,
           textDocumentPosition.position.character - (textDocumentPosition.position.line === literal.contentRange.start.line ? literal.contentRange.start.character : 0)
         );
-
         const babelInputFilename = `${document.uri}/literal-${currentLiteralIndex}.pug.virtual.js`;
         const virtualTsxFilename = `${document.uri}/literal-${currentLiteralIndex}.pug.virtual.tsx`;
-
         const compileResult = compilePugToJsxString(rawPugInLiteral, { classAttribute: settings.classAttribute }, babelInputFilename);
-        if (compileResult.error || !compileResult.jsx || !compileResult.sourceMap) {
-          continue;
-        }
 
+        if (compileResult.error || !compileResult.jsx || !compileResult.sourceMap) continue;
         const mapData = await parseSourceMap(compileResult.sourceMap, rawPugInLiteral, compileResult.jsx);
-        if (!mapData) {
-          continue;
-        }
-
+        if (!mapData) continue;
         const jsxPosition = mapPugPositionToJsxPosition(cursorPugPosition, mapData);
-        if (!jsxPosition) {
-          destroySourceMapData(mapData);
-          continue;
-        }
+        if (!jsxPosition) { destroySourceMapData(mapData); continue; }
 
         const virtualTsxContent = `
 ${importStatements.join('\n')}
+${localParamTexts.join('\n')}
 ${localDeclarations.join('\n')}
 import React from 'react';
 const PugComponent = () => (<>${compileResult.jsx}</>);
@@ -578,26 +502,20 @@ export default PugComponent;
         `;
         updateVirtualFile(virtualTsxFilename, virtualTsxContent);
         const jsxOffset = positionToOffset(virtualTsxContent, jsxPosition);
-
         const quickInfo = tsLangService.getQuickInfoAtPosition(virtualTsxFilename, jsxOffset);
-        if (!quickInfo) {
-          destroySourceMapData(mapData);
-          return null;
-        }
+
+        if (!quickInfo) { destroySourceMapData(mapData); return null; }
 
         let hoverContentsValue = displayPartsToString(quickInfo.displayParts);
-        if (quickInfo.documentation && quickInfo.documentation.length > 0) {
-          hoverContentsValue += "\n\n---\n" + displayPartsToString(quickInfo.documentation);
-        }
-
+        if (quickInfo.documentation?.length) hoverContentsValue += "\n\n---\n" + displayPartsToString(quickInfo.documentation);
         let hoverRange: Range | undefined = undefined;
+
         if (quickInfo.textSpan) {
           const jsxSourceFile = tsLangService.getProgram()?.getSourceFile(virtualTsxFilename);
           if (jsxSourceFile) {
             const startLoc = ts.getLineAndCharacterOfPosition(jsxSourceFile, quickInfo.textSpan.start);
             const endLoc = ts.getLineAndCharacterOfPosition(jsxSourceFile, quickInfo.textSpan.start + quickInfo.textSpan.length);
-            const jsxRangeVal = Range.create(startLoc.line, startLoc.character, endLoc.line, endLoc.character); // Renamed to avoid conflict
-
+            const jsxRangeVal = Range.create(startLoc.line, startLoc.character, endLoc.line, endLoc.character);
             const mappedPugRange = mapJsxRangeToPugRange(jsxRangeVal, mapData);
             if (mappedPugRange) {
               hoverRange = Range.create(
@@ -610,11 +528,7 @@ export default PugComponent;
           }
         }
         destroySourceMapData(mapData);
-
-        return {
-          contents: { kind: 'markdown', value: hoverContentsValue },
-          range: hoverRange,
-        };
+        return { contents: { kind: 'markdown', value: hoverContentsValue }, range: hoverRange };
       }
     }
     return null;
@@ -625,7 +539,6 @@ connection.onDefinition(
   async (textDocumentPosition: TextDocumentPositionParams): Promise<Location[] | null> => {
     const document = documents.get(textDocumentPosition.textDocument.uri);
     if (!document) return null;
-
     const settings = await getDocumentSettings(document.uri);
     const pugLiterals = findPugLiterals(document);
     const importStatements = extractImportStatements(document);
@@ -634,39 +547,30 @@ connection.onDefinition(
 
     for (const literal of pugLiterals) {
       const currentLiteralIndex = literalIndex++;
-      const docOffset = positionToOffset(document.getText(), textDocumentPosition.position);
-      const literalContentStartOffset = positionToOffset(document.getText(), literal.contentRange.start);
-      const literalContentEndOffset = positionToOffset(document.getText(), literal.contentRange.end);
+      const docOffset = positionToOffset(documentText, textDocumentPosition.position);
+      const literalContentStartOffset = positionToOffset(documentText, literal.contentRange.start);
+      const literalContentEndOffset = positionToOffset(documentText, literal.contentRange.end);
 
       if (docOffset >= literalContentStartOffset && docOffset <= literalContentEndOffset) {
         const rawPugInLiteral = literal.content;
-        const localDeclarations = extractDeclarationsFromScope(literal.enclosingScopeNode, documentText);
+        const { declarations: localDeclarations, paramTexts: localParamTexts } = extractDeclarationsAndParamsFromScope(literal.enclosingScopeNode, documentText);
         const cursorPugPosition = Position.create(
           textDocumentPosition.position.line - literal.contentRange.start.line,
           textDocumentPosition.position.character - (textDocumentPosition.position.line === literal.contentRange.start.line ? literal.contentRange.start.character : 0)
         );
-
         const babelInputFilename = `${document.uri}/literal-${currentLiteralIndex}.pug.virtual.js`;
         const virtualTsxFilename = `${document.uri}/literal-${currentLiteralIndex}.pug.virtual.tsx`;
-
         const compileResult = compilePugToJsxString(rawPugInLiteral, { classAttribute: settings.classAttribute }, babelInputFilename);
-        if (compileResult.error || !compileResult.jsx || !compileResult.sourceMap) {
-          continue;
-        }
 
+        if (compileResult.error || !compileResult.jsx || !compileResult.sourceMap) continue;
         const mapData = await parseSourceMap(compileResult.sourceMap, rawPugInLiteral, compileResult.jsx);
-        if (!mapData) {
-          continue;
-        }
-
+        if (!mapData) continue;
         const jsxPosition = mapPugPositionToJsxPosition(cursorPugPosition, mapData);
-        if (!jsxPosition) {
-          destroySourceMapData(mapData);
-          continue;
-        }
+        if (!jsxPosition) { destroySourceMapData(mapData); continue; }
 
         const virtualTsxContent = `
 ${importStatements.join('\n')}
+${localParamTexts.join('\n')}
 ${localDeclarations.join('\n')}
 import React from 'react';
 const PugComponent = () => (<>${compileResult.jsx}</>);
@@ -674,30 +578,21 @@ export default PugComponent;
         `;
         updateVirtualFile(virtualTsxFilename, virtualTsxContent);
         const jsxOffset = positionToOffset(virtualTsxContent, jsxPosition);
-
         const definitionInfo = tsLangService.getDefinitionAtPosition(virtualTsxFilename, jsxOffset);
-        if (!definitionInfo || definitionInfo.length === 0) {
-          destroySourceMapData(mapData);
-          return null;
-        }
+
+        if (!definitionInfo || definitionInfo.length === 0) { destroySourceMapData(mapData); return null; }
 
         const locations: Location[] = [];
         const tsProgram = tsLangService.getProgram();
-
         for (const defSite of definitionInfo) {
           const targetFileName = defSite.fileName;
           const targetTextSpan = defSite.textSpan;
-          let targetUri: string;
-          let targetRange: Range;
-
           const targetSourceFile = tsProgram?.getSourceFile(targetFileName);
-          if (!targetSourceFile) {
-            continue;
-          }
+          if (!targetSourceFile) continue;
 
           const startLoc = ts.getLineAndCharacterOfPosition(targetSourceFile, targetTextSpan.start);
           const endLoc = ts.getLineAndCharacterOfPosition(targetSourceFile, targetTextSpan.start + targetTextSpan.length);
-          targetRange = Range.create(startLoc.line, startLoc.character, endLoc.line, endLoc.character);
+          const targetRange = Range.create(startLoc.line, startLoc.character, endLoc.line, endLoc.character);
 
           if (targetFileName === virtualTsxFilename) {
             const mappedPugRange = mapJsxRangeToPugRange(targetRange, mapData);
@@ -714,11 +609,8 @@ export default PugComponent;
             }
           } else {
             try {
-                targetUri = pathToFileURL(targetFileName).toString();
-                locations.push({ uri: targetUri, range: targetRange });
-            } catch (e) {
-                // console.error
-            }
+              locations.push({ uri: pathToFileURL(targetFileName).toString(), range: targetRange });
+            } catch (e) { /* console.error */ }
           }
         }
         destroySourceMapData(mapData);

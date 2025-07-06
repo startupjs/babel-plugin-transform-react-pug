@@ -299,7 +299,93 @@ describe('onDefinition Handler', () => {
     // A more accurate test would need `server.ts` to distinguish definitions in prepended code vs. pug-generated JSX.
     // For now, we test that *a* location within the original doc is returned.
     expect(result[0].range).toBeDefined();
-    expect(serverModule.extractDeclarationsFromScope).toHaveBeenCalledWith(functionScopeNode, docContent);
+    expect(serverModule.extractDeclarationsAndParamsFromScope).toHaveBeenCalledWith(functionScopeNode, docContent); // Updated function name
 
+  });
+
+  it('should go to definition for an enclosing function parameter used in Pug', async () => {
+    const pugContent = "p #{paramAlpha}"; // Going to definition of paramAlpha
+    const docContent = `
+      function MyComponentWithParams(paramAlpha, paramBeta) {
+        return pug\`${pugContent}\`;
+      }
+    `;
+    const docUri = 'file:///test-param-def.tsx';
+    const doc = createDoc(docUri, docContent);
+    const literalContentRange = Range.create(2, 20, 2, 20 + pugContent.length);
+
+    const programAst = acorn.parse(docContent, { ecmaVersion: 'latest', sourceType: 'module', locations:true });
+    const functionScopeNode = (programAst as any).body.find(n => n.type === 'FunctionDeclaration');
+
+    serverModule.documents = { get: jest.fn().mockReturnValue(doc) };
+    serverModule.findPugLiterals.mockReturnValue([{
+      content: pugContent,
+      contentRange: literalContentRange,
+      enclosingScopeNode: functionScopeNode,
+    }]);
+    serverModule.extractImportStatements.mockReturnValue([]);
+    jest.spyOn(serverModule, 'extractDeclarationsAndParamsFromScope').mockReturnValue({
+        declarations: [],
+        paramTexts: ["let paramAlpha: any;", "let paramBeta: any;"]
+    });
+
+    const generatedJsx = "<p>{paramAlpha}</p>";
+    (compilePugToJsxString as jest.Mock).mockReturnValue({ jsx: generatedJsx, sourceMap: { version: 3, sources:[], mappings:'' }});
+    const mockMapData = { consumer: {}, originalPugContent: pugContent, generatedJsxContent: generatedJsx };
+    (parseSourceMap as jest.Mock).mockResolvedValue(mockMapData);
+
+    const cursorPugPosition = Position.create(0, pugContent.indexOf('paramAlpha'));
+    const mappedJsxPosition = Position.create(0, generatedJsx.indexOf('paramAlpha'));
+    (mapPugPositionToJsxPosition as jest.Mock).mockReturnValue(mappedJsxPosition);
+
+    const virtualTsxFilename = `${docUri}/literal-0.pug.virtual.tsx`;
+    // Content: let paramAlpha: any; ... import React... const Comp = () => <p>{paramAlpha}</p>;
+    // The definition of 'paramAlpha' is its dummy declaration.
+    const definitionStartOffsetInVirtual = virtualTsxContent.indexOf("paramAlpha: any;");
+    const definitionLength = "paramAlpha".length;
+
+    const mockDefinitionInfo: ts.DefinitionInfo[] = [{
+      fileName: virtualTsxFilename, // Definition is the dummy 'let paramAlpha: any;'
+      textSpan: { start: definitionStartOffsetInVirtual, length: definitionLength },
+      kind: ts.ScriptElementKind.parameterElement, name: 'paramAlpha',
+      containerKind: ts.ScriptElementKind.unknown, containerName: ''
+    }];
+    mockTsLangService.getDefinitionAtPosition.mockReturnValue(mockDefinitionInfo);
+
+    const virtualTsxContent = `let paramAlpha: any;\nlet paramBeta: any;\nimport React from 'react';\nconst C = () => (<>${generatedJsx}</>);`;
+    const mockJsxSourceFile = { text: virtualTsxContent, statements: [], fileName: virtualTsxFilename };
+    mockTsLangService.getProgram().getSourceFile.mockReturnValue(mockJsxSourceFile);
+
+    mockTs.getLineAndCharacterOfPosition.mockImplementation((sf, offset) => {
+      // For 'paramAlpha' in 'let paramAlpha: any;'
+      if (sf === mockJsxSourceFile && offset === definitionStartOffsetInVirtual) return { line: 0, character: virtualTsxContent.indexOf("paramAlpha: any;") + "let ".length };
+      if (sf === mockJsxSourceFile && offset === definitionStartOffsetInVirtual + definitionLength) return { line: 0, character: virtualTsxContent.indexOf("paramAlpha: any;") + "let ".length + definitionLength };
+      return { line: 0, character: 0 };
+    });
+
+    // mapJsxRangeToPugRange will be called for the definition of 'paramAlpha' (the dummy decl).
+    // Since this is prepended code, not from Pug, it won't map cleanly into the Pug literal's content range.
+    // The server's current logic for defSite.fileName === virtualTsxFilename will attempt this mapping.
+    // A truly accurate jump would go to the parameter in the original function signature.
+    // For this test, we accept that it maps to *some* range in the original document via the Pug literal,
+    // testing the pathway more than perfect accuracy of this specific edge case's target range.
+    const mappedPugDefRange = Range.create(0, 0, 0, 10); // Arbitrary mapped range in Pug
+    (mapJsxRangeToPugRange as jest.Mock).mockReturnValue(mappedPugDefRange);
+
+    const requestPosition = Position.create(2, 20 + cursorPugPosition.character);
+    const result = await onDefinitionHandler({ textDocument: { uri: docUri }, position: requestPosition });
+
+    expect(result).not.toBeNull();
+    expect(result).toHaveLength(1);
+    expect(result[0].uri).toBe(docUri); // Should point back to the original document
+    // The range will be based on mappedPugDefRange, relative to the Pug literal.
+    const expectedDocRelativePugDefRange = Range.create(
+        literalContentRange.start.line + mappedPugDefRange.start.line,
+        (mappedPugDefRange.start.line === 0 ? literalContentRange.start.character : 0) + mappedPugDefRange.start.character,
+        literalContentRange.start.line + mappedPugDefRange.end.line,
+        (mappedPugDefRange.end.line === 0 ? literalContentRange.start.character : 0) + mappedPugDefRange.end.character
+    );
+    expect(result[0].range).toEqual(expectedDocRelativePugDefRange);
+    expect(serverModule.extractDeclarationsAndParamsFromScope).toHaveBeenCalledWith(functionScopeNode, docContent);
   });
 });

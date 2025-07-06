@@ -361,7 +361,82 @@ describe('validateTextDocument - Diagnostics via JSX', () => {
     expect(diag.message).toBe("This expression is not callable because type 'number' has no call signatures.");
     expect(diag.severity).toBe(DiagnosticSeverity.Error);
     expect(diag.source).toBe('React Pug (TS)');
-    expect(serverModule.extractDeclarationsFromScope).toHaveBeenCalledWith(functionScopeNode, docContent);
+    expect(serverModule.extractDeclarationsAndParamsFromScope).toHaveBeenCalledWith(functionScopeNode, docContent); // Updated function name
+  });
+
+  it('should provide diagnostics for misuse of enclosing function parameters in Pug', async () => {
+    const pugContent = "p #{paramNum()}"; // paramNum is a number (from dummy decl), not a function
+    const docContent = `
+      function MyParamErrorComponent(paramNum, paramStr) {
+        return pug\`${pugContent}\`;
+      }
+    `;
+    const docUri = 'file:///test-param-diag.tsx';
+    const doc = createDoc(docUri, docContent);
+    const literalContentRange = Range.create(2, 20, 2, 20 + pugContent.length);
+
+    const programAst = acorn.parse(docContent, { ecmaVersion: 'latest', sourceType: 'module', locations:true });
+    const functionScopeNode = (programAst as any).body.find(n => n.type === 'FunctionDeclaration');
+
+    serverModule.documents = { get: jest.fn().mockReturnValue(doc) };
+    serverModule.findPugLiterals.mockReturnValue([{
+      content: pugContent,
+      contentRange: literalContentRange,
+      enclosingScopeNode: functionScopeNode,
+    }]);
+    serverModule.extractImportStatements.mockReturnValue([]);
+    jest.spyOn(serverModule, 'extractDeclarationsAndParamsFromScope').mockReturnValue({
+        declarations: [],
+        paramTexts: ["let paramNum: any;", "let paramStr: any;"] // TS will infer 'any' if not specified, or treat as such for some checks
+    });
+
+    const generatedJsx = "<p>{paramNum()}</p>";
+    (compilePugToJsxString as jest.Mock).mockReturnValue({ jsx: generatedJsx, sourceMap: { version: 3, sources:[], mappings:'' }});
+    const mockMapData = { consumer: {}, originalPugContent: pugContent, generatedJsxContent: generatedJsx };
+    (parseSourceMap as jest.Mock).mockResolvedValue(mockMapData);
+
+    const mockTsErrorDiagnostic: ts.Diagnostic = {
+      file: undefined,
+      start: generatedJsx.indexOf("paramNum()"),
+      length: "paramNum()".length,
+      messageText: "This expression is not callable.", // General error for calling non-function
+      category: ts.DiagnosticCategory.Error, code: 2349,
+    };
+    mockTsLangService.getSemanticDiagnostics.mockReturnValue([mockTsErrorDiagnostic]);
+    mockTsLangService.getSyntacticDiagnostics.mockReturnValue([]);
+
+    const virtualTsxFilename = `${docUri}/literal-0.pug.virtual.tsx`;
+    const virtualTsxContent = `let paramNum: any;\nlet paramStr: any;\nimport React from 'react';\nconst C = () => (<>${generatedJsx}</>);`;
+    const mockJsxSourceFile = { text: virtualTsxContent, statements: [], fileName: virtualTsxFilename };
+    mockTsLangService.getProgram().getSourceFile.mockReturnValue(mockJsxSourceFile);
+
+    mockTs.getLineAndCharacterOfPosition.mockImplementation((sf, offset) => {
+      const str = "paramNum()"; const idx = generatedJsx.indexOf(str);
+      if (sf === mockJsxSourceFile && offset === idx) return { line: 0, character: idx + "{".length };
+      if (sf === mockJsxSourceFile && offset === idx + str.length) return { line: 0, character: idx + "{".length + str.length };
+      return { line: 0, character: 0 };
+    });
+
+    const pugErrorRange = Range.create(0, pugContent.indexOf('paramNum()'), 0, pugContent.indexOf('paramNum()') + 'paramNum()'.length);
+    (mapJsxRangeToPugRange as jest.Mock).mockReturnValue(pugErrorRange);
+
+    await validateTextDocumentInternal(doc);
+
+    expect(mockConnection.sendDiagnostics).toHaveBeenCalledTimes(1);
+    const sentDiagnostics = mockConnection.sendDiagnostics.mock.calls[0][0].diagnostics;
+    expect(sentDiagnostics).toHaveLength(1);
+    const diag = sentDiagnostics[0] as Diagnostic;
+
+    const expectedDocRelativePugErrorRange = Range.create(
+      literalContentRange.start.line + pugErrorRange.start.line,
+      (pugErrorRange.start.line === 0 ? literalContentRange.start.character : 0) + pugErrorRange.start.character,
+      literalContentRange.start.line + pugErrorRange.end.line,
+      (pugErrorRange.end.line === 0 ? literalContentRange.start.character : 0) + pugErrorRange.end.character
+    );
+    expect(diag.range).toEqual(expectedDocRelativePugErrorRange);
+    expect(diag.message).toBe("This expression is not callable.");
+    expect(diag.severity).toBe(DiagnosticSeverity.Error);
+    expect(serverModule.extractDeclarationsAndParamsFromScope).toHaveBeenCalledWith(functionScopeNode, docContent);
   });
 });
 

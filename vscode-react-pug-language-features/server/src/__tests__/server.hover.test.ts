@@ -298,4 +298,89 @@ describe('onHover Handler', () => {
     expect(result.range).toEqual(expectedDocRelativeRange);
     expect(serverModule.extractDeclarationsFromScope).toHaveBeenCalledWith(functionScopeNode, docContent);
   });
+
+  it('should provide hover information for enclosing function parameters', async () => {
+    const pugContent = "p #{hoverParam}"; // Hovering over hoverParam
+    const docContent = `
+      function TestHoverParams(hoverParam, anotherParam) {
+        return pug\`${pugContent}\`;
+      }
+    `;
+    const doc = createDoc('file:///test-func-params-hover.tsx', docContent);
+    const literalContentRange = Range.create(2, 20, 2, 20 + pugContent.length);
+
+    const programAst = acorn.parse(docContent, { ecmaVersion: 'latest', sourceType: 'module', locations:true });
+    const functionScopeNode = (programAst as any).body.find(n => n.type === 'FunctionDeclaration');
+
+    serverModule.documents = { get: jest.fn().mockReturnValue(doc) };
+    serverModule.findPugLiterals.mockReturnValue([{
+      content: pugContent,
+      contentRange: literalContentRange,
+      indentation: "  ",
+      enclosingScopeNode: functionScopeNode,
+    }]);
+    serverModule.extractImportStatements.mockReturnValue([]);
+    // Mock extractDeclarationsAndParamsFromScope to return dummy param declarations
+    jest.spyOn(serverModule, 'extractDeclarationsAndParamsFromScope').mockReturnValue({
+        declarations: [],
+        paramTexts: ["let hoverParam: any;", "let anotherParam: any;"]
+    });
+
+    const generatedJsx = "<p>{hoverParam}</p>";
+    (compilePugToJsxString as jest.Mock).mockReturnValue({ jsx: generatedJsx, sourceMap: { version: 3, sources:[], mappings:'' } });
+
+    const mockMapData = { consumer: {}, originalPugContent: pugContent, generatedJsxContent: generatedJsx };
+    (parseSourceMap as jest.Mock).mockResolvedValue(mockMapData);
+
+    const cursorPugPosition = Position.create(0, pugContent.indexOf('hoverParam') + 'hoverParam'.length);
+    const mappedJsxPosition = Position.create(0, generatedJsx.indexOf('hoverParam') + 'hoverParam'.length);
+    (mapPugPositionToJsxPosition as jest.Mock).mockReturnValue(mappedJsxPosition);
+
+    const virtualTsxContent = `let hoverParam: any;\nlet anotherParam: any;\nimport React from 'react';\nconst C = () => (<>${generatedJsx}</>);`;
+    const jsxOffset = 100; // Dummy offset
+    (positionToOffset as jest.Mock).mockReturnValue(jsxOffset);
+
+    const mockQuickInfoResult: ts.QuickInfo = {
+      kind: ts.ScriptElementKind.parameterElement,
+      kindModifiers: '',
+      textSpan: { start: jsxOffset - 'hoverParam'.length, length: 'hoverParam'.length },
+      displayParts: [{ text: '(parameter) hoverParam: any', kind: 'text' }],
+      documentation: [{text: 'A function parameter.', kind: 'text'}]
+    };
+    mockTsLangService.getQuickInfoAtPosition.mockReturnValue(mockQuickInfoResult);
+
+    const mockJsxSourceFile = { text: virtualTsxContent, statements: [], fileName: `${doc.uri}/literal-0.pug.virtual.tsx` };
+    mockTsLangService.getProgram().getSourceFile.mockReturnValue(mockJsxSourceFile);
+
+    mockTs.getLineAndCharacterOfPosition.mockImplementation((sf, offset) => {
+      if (offset === jsxOffset - 'hoverParam'.length) return { line: 0, character: mappedJsxPosition.character - 'hoverParam'.length };
+      if (offset === jsxOffset) return { line: 0, character: mappedJsxPosition.character };
+      return { line:0, character:0};
+    });
+
+    const pugHoverRange = Range.create(
+        cursorPugPosition.line,
+        cursorPugPosition.character - 'hoverParam'.length,
+        cursorPugPosition.line,
+        cursorPugPosition.character
+    );
+    (mapJsxRangeToPugRange as jest.Mock).mockReturnValue(pugHoverRange);
+
+    const requestPosition = Position.create(2, 20 + cursorPugPosition.character);
+    const result = await onHoverHandler({ textDocument: { uri: doc.uri }, position: requestPosition });
+
+    expect(result).not.toBeNull();
+    expect(result.contents).toEqual({
+      kind: 'markdown',
+      value: '(parameter) hoverParam: any\n\n---\nA function parameter.'
+    });
+    const expectedDocRelativeRange = Range.create(
+        literalContentRange.start.line + pugHoverRange.start.line,
+        (pugHoverRange.start.line === 0 ? literalContentRange.start.character : 0) + pugHoverRange.start.character,
+        literalContentRange.start.line + pugHoverRange.end.line,
+        (pugHoverRange.end.line === 0 ? literalContentRange.start.character : 0) + pugHoverRange.end.character
+    );
+    expect(result.range).toEqual(expectedDocRelativeRange);
+    expect(serverModule.extractDeclarationsAndParamsFromScope).toHaveBeenCalledWith(functionScopeNode, docContent);
+  });
 });
