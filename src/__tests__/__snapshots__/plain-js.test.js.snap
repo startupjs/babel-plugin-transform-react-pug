@@ -27,10 +27,10 @@ exports[`code-multiline JavaScript output: transformed source code 1`] = `
 const log = text => text;
 
 module.exports = (
-  <React.Fragment>
+  <>
     {((_greeting = \\"hello\\"), null)}
     {(log(_greeting), null)}
-  </React.Fragment>
+  </>
 );
 "
 `;
@@ -64,14 +64,14 @@ exports[`each static html output: static html 1`] = `"<div>1</div><div>2</div><d
 
 exports[`each-multiple JavaScript output: transformed source code 1`] = `
 "module.exports = (
-  <React.Fragment>
+  <>
     {[1, 2, 3].map(item => {
       return <div key={item}>{item}</div>;
     })}
     {[1, 2, 3].map(item => {
       return <div key={item}>{item}</div>;
     })}
-  </React.Fragment>
+  </>
 );
 "
 `;

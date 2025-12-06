@@ -16,9 +16,9 @@ exports[`JavaScript output: transformed source code 1`] = `
               return <span key={item}>{item}</span>;
             })
           ) : (
-            <React.Fragment>
+            <>
               This is <strong>literally</strong> the same list!
-            </React.Fragment>
+            </>
           )}
         </div>
       );

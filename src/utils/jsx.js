@@ -3,7 +3,7 @@
 import t from '../lib/babel-types';
 
 type JSXChildren = Array<
-  JSXText | JSXExpressionContainer | JSXSpreadChild | JSXElement,
+  JSXText | JSXExpressionContainer | JSXSpreadChild | JSXElement | JSXFragment,
 >;
 
 export function buildJSXElement(
@@ -26,16 +26,10 @@ const isAllowedChild = item =>
     'JSXExpressionContainer',
     'JSXSpreadChild',
     'JSXElement',
+    'JSXFragment',
   ].includes(item.type);
 
-// TODO: This can be replaced when migrating to Babel 7 as JSXFragment
-// has been added in v7.0.0-beta.30.
-export function buildJSXFragment(children: Array<any>): JSXElement {
-  const fragmentExpression = t.jSXMemberExpression(
-    t.jSXIdentifier('React'),
-    t.jSXIdentifier('Fragment'),
-  );
-
+export function buildJSXFragment(children: Array<any>): JSXFragment {
   const jSXChildren = children.map(item => {
     if (!isAllowedChild(item)) {
       if (item.type === 'StringLiteral') {
@@ -48,5 +42,9 @@ export function buildJSXFragment(children: Array<any>): JSXElement {
     return item;
   });
 
-  return buildJSXElement(fragmentExpression, [], jSXChildren);
+  return t.jSXFragment(
+    t.jSXOpeningFragment(),
+    t.jSXClosingFragment(),
+    jSXChildren,
+  );
 }
