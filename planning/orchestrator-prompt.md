@@ -63,7 +63,8 @@ Follow this cycle strictly for every task:
 3. REVIEW  → You read dev's code, check it matches plan.md and acceptance criteria
 4. QA      → Assign corresponding test task to qa, qa writes + runs tests
 5. VERIFY  → You verify tests are comprehensive and passing
-6. DONE    → Mark task done only after both code and tests are verified
+6. COMMIT  → Create a git commit for this task (see Git Workflow below)
+7. DONE    → Mark task done only after code, tests, and commit are verified
 ```
 
 If review or verification fails:
@@ -106,6 +107,16 @@ Before starting each milestone:
 4. Order tasks so each builds on the previous one
 5. Identify which tasks can be parallelized (dev and qa working simultaneously on independent items)
 
+## Git Workflow
+
+- **Develop on `master` branch.** Do not create feature branches. All work happens directly on master.
+- **Commit after every task.** Once a task passes all quality gates (code reviewed, tests written and passing), create a commit immediately. Do not accumulate multiple tasks in a single commit.
+- **Commit message format**: `feat(M<milestone>): <short description of what the task accomplished>`
+  - Examples: `feat(M0): scaffold project structure and build pipeline`, `feat(M1): add TextMate grammar for pug syntax highlighting`, `feat(M2): implement pug region extraction from tagged templates`
+- **Stage only the files relevant to the task.** Use `git add <specific files>` — never `git add -A` or `git add .`.
+- **Never amend commits.** Always create new commits.
+- **Do not push** unless the user explicitly asks.
+
 ## Important Rules
 
 1. **Never skip testing.** Every feature must have tests before moving on.
@@ -114,7 +125,7 @@ Before starting each milestone:
 4. **Run tests yourself** after QA says they pass. Trust but verify.
 5. **Keep tasks.md updated** in real-time. It's the source of truth for project status.
 6. **If something conflicts with plan.md**, discuss with me (the user) before deviating.
-7. **Commit after each milestone** is fully complete and all tests pass. Use conventional commit messages.
+7. **Commit after every completed task** — not just at milestone boundaries.
 8. **Start M0 immediately** after setting up the team. Don't wait for user input unless you have a blocking question.
 
 ## Getting Started
@@ -122,8 +133,9 @@ Before starting each milestone:
 1. Read `plan.md` thoroughly
 2. Create the team and spawn dev + qa agents
 3. Create `tasks.md` with M0 tasks broken down
-4. Begin the M0 → assign → review → test → verify cycle
-5. After M0 is complete, commit with message `feat: M0 — project scaffolding and architecture spike`
-6. Continue to M1, M2, etc.
+4. Begin the task cycle: plan → dev → review → qa → verify → commit → done
+5. Commit after each task, working directly on master
+6. After completing all tasks in a milestone, move to the next one
+7. Continue through M0, M1, M2, etc.
 
 Go.
